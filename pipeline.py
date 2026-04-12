@@ -362,13 +362,48 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
         if chat_id and chat_id in active_jobs:
             active_jobs[chat_id]['process'] = process
             
-        stdout, stderr = await process.communicate()
+        viewer = EncodingProgressViewer(status_message, chat_id) if status_message else None
+        
+        time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        fps_pattern = re.compile(r"fps=\s*([\d\.]+)")
+        speed_pattern = re.compile(r"speed=\s*([\d\.x]+)")
+        
+        stderr_buffer = []
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+                
+            line_str = line.decode('utf-8', errors='ignore').strip()
+            stderr_buffer.append(line_str)
+            if len(stderr_buffer) > 10:
+                stderr_buffer.pop(0)
+                
+            if viewer and total_duration > 0:
+                time_match = time_pattern.search(line_str)
+                if time_match:
+                    h, m, s = time_match.groups()
+                    current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                    fps_match = fps_pattern.search(line_str)
+                    fps = fps_match.group(1) if fps_match else "0"
+                    speed_match = speed_pattern.search(line_str)
+                    speed = speed_match.group(1) if speed_match else "0x"
+                    
+                    try:
+                        await viewer.update(current_sec, total_duration, fps, speed)
+                    except Exception as e:
+                        if "User Cancelled" in str(e):
+                            process.terminate()
+                            raise
+        
+        await process.wait()
         
         if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
             raise Exception("User Cancelled")
             
         if process.returncode != 0:
-            raise Exception(f"FFmpeg failed: {stderr.decode()}")
+            error_msg = "\n".join(stderr_buffer)
+            raise Exception(f"FFmpeg failed:\n{error_msg}")
             
         print("⚡ Encoding via RTX 6000 NVENC completed successfully!")
     except Exception as e:
