@@ -128,22 +128,33 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
         "Range": f"bytes={start}-{end}", 
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    res = requests.get(url, headers=headers, stream=True, allow_redirects=True)
-    res.raise_for_status()
-    with open(output_path, "rb+") as f:
-        f.seek(start)
-        for chunk in res.iter_content(chunk_size=1024*1024):
-            if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-                break
-            if chunk:
-                f.write(chunk)
-                progress_list[idx] += len(chunk)
+    retries = 3
+    for attempt in range(retries):
+        try:
+            # Strict timeout prevents the infinite 40s freezing
+            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(5, 15))
+            res.raise_for_status()
+            with open(output_path, "rb+") as f:
+                # Resume exactly where this specific thread left off
+                f.seek(start + progress_list[idx])
+                for chunk in res.iter_content(chunk_size=1024*1024):
+                    if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+                        return
+                    if chunk:
+                        f.write(chunk)
+                        progress_list[idx] += len(chunk)
+            return # Success
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(2)
+            
+    raise Exception(f"Download thread {idx} permanently failed.")
 
 async def download_video_from_url(url, output_path, progress_viewer):
     loop = asyncio.get_running_loop()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True)
+    res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(5, 15))
     
     try:
         res.raise_for_status()
