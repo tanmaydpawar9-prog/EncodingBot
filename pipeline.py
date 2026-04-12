@@ -124,11 +124,7 @@ def get_target_bitrate(input_file, quality_choice):
 # ==========================================
 
 def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
-    headers = {
-        "Range": f"bytes={start}-{end}", 
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    retries = 3
+    retries = 10
     for attempt in range(retries):
         current_start = start + progress_list[idx]
         if current_start > end:
@@ -139,8 +135,8 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         try:
-            # Generous timeout for slow servers
-            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 30))
+            # Generous timeout for slow servers and Heroku's strict limits
+            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 60))
             res.raise_for_status()
             
             if res.status_code == 200:
@@ -149,7 +145,8 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             with open(output_path, "rb+") as f:
                 # Resume exactly where this specific thread left off
                 f.seek(current_start)
-                for chunk in res.iter_content(chunk_size=2*1024*1024):
+                # 1MB chunks to ensure we save progress frequently if Heroku kills the connection
+                for chunk in res.iter_content(chunk_size=1024*1024):
                     if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                         return
                     if chunk:
@@ -158,14 +155,11 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
                         if start + progress_list[idx] > end:
                             break
             return # Success
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
-            time.sleep(2)
         except Exception as e:
-            logger.warning(f"Thread {idx} error: {e}")
-            time.sleep(2)
+            logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(3)
             
-    raise Exception(f"Download thread {idx} permanently failed.")
+    raise Exception(f"Download thread {idx} permanently failed after {retries} retries.")
 
 async def download_video_from_url(url, output_path, progress_viewer):
     loop = asyncio.get_running_loop()
@@ -491,7 +485,7 @@ async def start_callback(client, callback_query):
         except Exception:
             pass
 
-        # --- 4. Shutdown to save credits ---
+        # --- 4. Shutdown to credits ---
         deactivate_machine()
         
     except Exception as e:
