@@ -6,6 +6,7 @@ import subprocess
 import logging
 import asyncio
 import requests
+import concurrent.futures
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
@@ -122,40 +123,92 @@ def get_target_bitrate(input_file, quality_choice):
 # Fast Download, Encode, and Upload 
 # ==========================================
 
+def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
+    headers = {
+        "Range": f"bytes={start}-{end}", 
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    res = requests.get(url, headers=headers, stream=True, allow_redirects=True)
+    res.raise_for_status()
+    with open(output_path, "rb+") as f:
+        f.seek(start)
+        for chunk in res.iter_content(chunk_size=1024*1024):
+            if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+                break
+            if chunk:
+                f.write(chunk)
+                progress_list[idx] += len(chunk)
+
 async def download_video_from_url(url, output_path, progress_viewer):
     loop = asyncio.get_running_loop()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True)
+    
+    try:
+        res.raise_for_status()
+    except requests.exceptions.HTTPError:
+        raise ValueError(f"Download failed: Server returned HTTP {res.status_code}.")
 
-    def _download():
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, stream=True, headers=headers, allow_redirects=True)
+    content_type = res.headers.get('Content-Type', '')
+    if 'text/' in content_type.lower():
+        raise ValueError(f"URL returned text/webpage ({content_type}), not a direct video file.")
         
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError:
-            raise ValueError(f"Download failed: Server returned HTTP {response.status_code}.")
+    total_size = int(res.headers.get('content-length', 0))
+    accept_ranges = res.headers.get('accept-ranges', '').lower() == 'bytes'
+    chat_id = progress_viewer.chat_id
+    
+    # If the server doesn't support chunked ranges, fallback to standard single-thread
+    if total_size == 0 or not accept_ranges:
+        def _single_download():
+            downloaded = 0
+            with open(output_path, 'wb') as f:
+                for chunk in res.iter_content(chunk_size=4*1024*1024):
+                    if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+                        raise Exception("User Cancelled")
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        asyncio.run_coroutine_threadsafe(progress_viewer.update(downloaded, total_size), loop)
+            if os.path.getsize(output_path) < 100 * 1024:
+                raise ValueError("Downloaded file is invalid or too small.")
+        await asyncio.to_thread(_single_download)
+        return
 
-        content_type = response.headers.get('Content-Type', '')
-        if 'text/' in content_type.lower():
-            raise ValueError(f"URL returned text/webpage ({content_type}), not a direct video file.")
-            
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
+    res.close()
+    
+    # 8-Part Parallel Download Implementation
+    with open(output_path, "wb") as f:
+        f.truncate(total_size) # Pre-allocate file on disk
         
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=4*1024*1024):
-                if progress_viewer.chat_id and active_jobs.get(progress_viewer.chat_id, {}).get('cancel'):
-                    raise Exception("User Cancelled")
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    asyncio.run_coroutine_threadsafe(progress_viewer.update(downloaded, total_size), loop)
-                    
-        if os.path.getsize(output_path) < 100 * 1024:
-            with open(output_path, 'r', errors='ignore') as f:
-                snippet = f.read(200)
-            raise ValueError(f"Downloaded file is invalid or too small. Server response: {snippet}")
+    num_threads = 8
+    chunk_size = total_size // num_threads
+    progress_list = [0] * num_threads
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = []
+        for i in range(num_threads):
+            start = i * chunk_size
+            end = total_size - 1 if i == num_threads - 1 else (i + 1) * chunk_size - 1
+            futures.append(loop.run_in_executor(
+                executor, _download_range, url, start, end, output_path, progress_list, i, chat_id
+            ))
+        
+        while True:
+            downloaded = sum(progress_list)
+            if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+                raise Exception("User Cancelled")
+                
+            await progress_viewer.update(downloaded, total_size)
             
-    await asyncio.to_thread(_download)
+            if downloaded >= total_size or all(f.done() for f in futures):
+                break
+            await asyncio.sleep(1)
+            
+        await asyncio.gather(*futures)
+        
+    if os.path.getsize(output_path) < 100 * 1024:
+        raise ValueError("Downloaded file is invalid or too small.")
 
 async def encode_video(input_file, output_file, quality_choice, chat_id=None):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
