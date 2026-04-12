@@ -139,8 +139,8 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         try:
-            # Strict timeout prevents the infinite 40s freezing
-            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(5, 15))
+            # Generous timeout for slow servers
+            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 30))
             res.raise_for_status()
             
             if res.status_code == 200:
@@ -171,12 +171,17 @@ async def download_video_from_url(url, output_path, progress_viewer):
     loop = asyncio.get_running_loop()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(5, 15))
-    
-    try:
-        res.raise_for_status()
-    except requests.exceptions.HTTPError:
-        raise ValueError(f"Download failed: Server returned HTTP {res.status_code}.")
+    for attempt in range(3):
+        try:
+            # 60s timeout allows sleeping servers (like Heroku) to wake up
+            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 60))
+            res.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt == 2:
+                raise ValueError(f"Download connection failed after 3 attempts: {e}")
+            logger.warning(f"Initial connection dropped (attempt {attempt+1}/3): {e}")
+            await asyncio.sleep(3)
 
     content_type = res.headers.get('Content-Type', '')
     if 'text/' in content_type.lower():
