@@ -79,6 +79,54 @@ class PyrogramProgressViewer:
             except Exception:
                 pass
 
+class EncodingProgressViewer:
+    def __init__(self, message, chat_id=None):
+        self.message = message
+        self.chat_id = chat_id
+        self.start_time = time.time()
+        self.last_update = 0
+        self.last_text = ""
+
+    async def update(self, current_sec, total_sec, fps, speed):
+        if self.chat_id and active_jobs.get(self.chat_id, {}).get('cancel'):
+            raise Exception("User Cancelled")
+            
+        now = time.time()
+        if now - self.last_update < 5 and current_sec < total_sec:
+            return
+        self.last_update = now
+        
+        elapsed = now - self.start_time
+        if elapsed < 0.1: elapsed = 0.1
+        
+        if total_sec > 0:
+            progress_pct = min((current_sec / total_sec) * 100, 100.0)
+            eta_sec = (total_sec - current_sec) / (current_sec / elapsed) if current_sec > 0 else 0
+        else:
+            progress_pct = 0
+            eta_sec = 0
+            
+        filled = int(progress_pct / 10)
+        bar = '■' * filled + '□' * (10 - filled)
+        
+        text = (
+            f"Progress: [{bar}] {progress_pct:.1f}%\n"
+            f"🎬 Encoding: {time.strftime('%H:%M:%S', time.gmtime(current_sec))} / {time.strftime('%H:%M:%S', time.gmtime(total_sec))}\n"
+            f"⚡ Speed: {fps} fps ({speed})\n"
+            f"⌛ ETA: {time.strftime('%Hh %Mm %Ss', time.gmtime(eta_sec))}\n"
+            f"⏱️ Time elapsed: {time.strftime('%Mm %Ss', time.gmtime(elapsed))}."
+        )
+        
+        if text != self.last_text:
+            try:
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Job", callback_data="cancel_job")]])
+                await self.message.edit_text(text, reply_markup=keyboard)
+                self.last_text = text
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                pass
+
 # ==========================================
 # 2 & 3. Naming and Size/Bitrate Logic
 # ==========================================
@@ -118,6 +166,17 @@ def get_target_bitrate(input_file, quality_choice):
         return int(original_bitrate * 0.125)
     
     return original_bitrate
+
+def get_video_duration(input_file):
+    """Gets the total duration of the video in seconds."""
+    cmd = [
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
+    ]
+    try:
+        return float(subprocess.check_output(cmd).decode().strip())
+    except Exception:
+        return 0.0
 
 # ==========================================
 # Fast Download, Encode, and Upload 
@@ -262,9 +321,10 @@ async def download_video_from_url(url, output_path, progress_viewer):
     if os.path.getsize(output_path) < 100 * 1024:
         raise ValueError("Downloaded file is invalid or too small.")
 
-async def encode_video(input_file, output_file, quality_choice, chat_id=None):
+async def encode_video(input_file, output_file, quality_choice, chat_id=None, status_message=None):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
     target_bitrate = get_target_bitrate(input_file, quality_choice)
+    total_duration = get_video_duration(input_file)
         
     # Map quality to fixed width, letting height auto-scale (-2)
     qual = quality_choice.upper()
@@ -489,7 +549,7 @@ async def start_callback(client, callback_query):
         await status_message.edit_text("✅ Download Complete! Starting encode...")
 
         # --- 2. Encode ---
-        await encode_video(local_input, final_output_name, session['quality'], chat_id)
+        await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
         await status_message.edit_text("✅ Encode Complete! Starting upload...")
 
         # --- 3. Upload (up to 2GB) ---
