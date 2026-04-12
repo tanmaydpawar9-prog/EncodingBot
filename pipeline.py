@@ -527,7 +527,8 @@ async def encode_command(client, message):
                 'source_type': 'url',
                 'url': url,
                 'original_name': original_name,
-                'message_to_reply': message.id
+                'message_to_reply': message.id,
+                'awaiting_name': True
             }
         else:
             await message.reply_text("⚠️ Please provide a valid HTTP/HTTPS URL.")
@@ -547,20 +548,12 @@ async def encode_command(client, message):
             'source_type': 'telegram',
             'file_id': file_id,
             'original_name': original_name,
-            'message_to_reply': reply.id
+            'message_to_reply': reply.id,
+            'awaiting_name': True
         }
     
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1080P", callback_data="qual_1080P"),
-            InlineKeyboardButton("720P", callback_data="qual_720P"),
-            InlineKeyboardButton("480P", callback_data="qual_480P"),
-        ]
-    ])
-    
     await message.reply_text(
-        f"✨ Found video: `{original_name}`\nPlease select the desired output quality.",
-        reply_markup=keyboard
+        f"✨ Found video: `{original_name}`\nPlease reply with the desired output filename (or type `/skip` to use the original name):"
     )
     
 @app.on_message(filters.command("log") & filters.private)
@@ -580,25 +573,48 @@ async def log_command(client, message):
     user_sessions[message.chat.id] = {
         'source_type': 'local',
         'vid_id': vid_id,
+        'original_name': f"video_{vid_id}.mkv",
         'message_to_reply': message.id,
         'awaiting_name': True
     }
-    await message.reply_text("📁 Video found in server cache! Please reply with the desired output filename (e.g. `MyVideo.mkv`):")
+    await message.reply_text("📁 Video found in server cache!\nPlease reply with the desired output filename (or type `/skip` to use default):")
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
-async def text_handler(client, message):
+@app.on_message((filters.text | filters.photo) & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
+async def meta_handler(client, message):
     chat_id = message.chat.id
-    if chat_id in user_sessions and user_sessions[chat_id].get('awaiting_name'):
-        original_name = message.text.strip()
-        if not "." in original_name:
-            original_name += ".mkv"
-        user_sessions[chat_id]['original_name'] = original_name
-        user_sessions[chat_id]['awaiting_name'] = False
+    if chat_id not in user_sessions:
+        return
+        
+    session = user_sessions[chat_id]
+    
+    if session.get('awaiting_name'):
+        if message.text and message.text.strip().lower() != '/skip':
+            new_name = message.text.strip()
+            if not "." in new_name:
+                new_name += ".mkv"
+            session['original_name'] = new_name
+            
+        session['awaiting_name'] = False
+        session['awaiting_thumbnail'] = True
+        await message.reply_text("🖼️ Please send a custom thumbnail photo (or type `/skip` to auto-extract one):")
+        return
+        
+    if session.get('awaiting_thumbnail'):
+        if message.photo:
+            session['custom_thumb'] = message.photo.file_id
+        elif message.text and message.text.strip().lower() != '/skip':
+            await message.reply_text("⚠️ Please send a PHOTO, or type `/skip`.")
+            return
+        else:
+            session['custom_thumb'] = None
+            
+        session['awaiting_thumbnail'] = False
         
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
         ])
-        await message.reply_text(f"✨ Name set to: `{original_name}`\nPlease select the desired output quality.", reply_markup=keyboard)
+        await message.reply_text(f"✨ Name set to: `{session['original_name']}`\nPlease select the desired output quality.", reply_markup=keyboard)
+        return
 
 @app.on_callback_query(filters.regex(r"^qual_"))
 async def quality_callback(client, callback_query):
@@ -674,8 +690,12 @@ async def start_callback(client, callback_query):
         # --- 2. Encode ---
         await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
         
-        await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
-        extract_thumbnail(local_input, thumb_path)
+        if session.get('custom_thumb'):
+            await status_message.edit_text("✅ Encode Complete! Downloading custom thumbnail...")
+            await client.download_media(session['custom_thumb'], file_name=thumb_path)
+        else:
+            await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
+            extract_thumbnail(local_input, thumb_path)
         
         await status_message.edit_text("✅ Starting upload...")
 
