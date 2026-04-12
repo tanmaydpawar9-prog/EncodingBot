@@ -3,9 +3,10 @@
 A high-speed, crash-proof video downloading, encoding, and uploading pipeline configured for Lightning AI Studio (RTX 6000). 
 
 ## Setup Instructions
-1. **Set Bot Token:** Before running, you must set your Telegram Bot Token as an environment variable. In the Lightning AI terminal, run:
+1. **Set Environment Variables:** Before running, you must set your Telegram Bot Token and your personal Telegram User ID to prevent unauthorized access. In the Lightning AI terminal, run:
    ```bash
    export BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
+   export ALLOWED_USER_ID="YOUR_TELEGRAM_USER_ID_HERE"
    ```
 
 2. **Install System Dependencies (FFmpeg):**

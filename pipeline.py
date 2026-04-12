@@ -192,6 +192,11 @@ def deactivate_machine():
 (GET_URL, GET_ORIGINAL_NAME, GET_QUALITY, CONFIRMATION) = range(4)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    allowed_user = os.getenv("ALLOWED_USER_ID")
+    if allowed_user and str(update.effective_user.id) != allowed_user:
+        await update.message.reply_text("❌ Access Denied: You are not authorized to use this bot.")
+        return
+
     await update.message.reply_text(
         "Welcome! I am a video encoding bot.\n"
         "Use the /encode command to start a new job."
@@ -199,6 +204,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def encode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation and asks for the video URL."""
+    allowed_user = os.getenv("ALLOWED_USER_ID")
+    if allowed_user and str(update.effective_user.id) != allowed_user:
+        await update.message.reply_text("❌ Access Denied: You are not authorized to use this bot.")
+        return ConversationHandler.END
+
     await update.message.reply_text("▶️ Starting new encoding job. Please send me the video source URL.")
     return GET_URL
 
