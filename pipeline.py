@@ -159,10 +159,12 @@ async def encode_video(input_file, output_file, quality_choice):
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
+        '-map', '0',               # Maps all streams (video, multiple audio, subtitles)
         '-vf', f'scale={scale}',
         '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
         '-b:v', str(target_bitrate),
-        '-c:a', 'copy',
+        '-c:a', 'copy',            # Copies all audio streams without re-encoding
+        '-c:s', 'copy',            # Copies all subtitle streams without re-encoding
         output_file
     ]
     
