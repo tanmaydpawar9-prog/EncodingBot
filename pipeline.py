@@ -6,7 +6,7 @@ import subprocess
 import requests
 import logging
 import asyncio
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,6 +14,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+    CallbackQueryHandler,
 )
 
 # --- Basic Bot Logging ---
@@ -221,17 +222,30 @@ async def get_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_original_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Stores the filename and asks for the output quality."""
     context.user_data['original_name'] = update.message.text
-    reply_keyboard = [["1080P", "720P", "480P"]]
+    
+    # Create Inline Buttons instead of bottom keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("1080P", callback_data="1080P"),
+            InlineKeyboardButton("720P", callback_data="720P"),
+            InlineKeyboardButton("480P", callback_data="480P"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
         "✨ Got it. Please select the desired output quality.",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
+        reply_markup=reply_markup,
     )
     return GET_QUALITY
 
 async def get_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Stores the quality and asks for final confirmation."""
-    context.user_data['quality_choice'] = update.message.text
+    query = update.callback_query
+    await query.answer()  # Acknowledge the button click
     
+    context.user_data['quality_choice'] = query.data
+
     # Generate final name for confirmation
     final_output_name = process_metadata(context.user_data['original_name'], context.user_data['quality_choice'])
     context.user_data['final_output_name'] = final_output_name
@@ -241,19 +255,31 @@ async def get_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         f"🔹 **Source:** `{context.user_data['source_url']}`\n"
         f"🔹 **Output Quality:** `{context.user_data['quality_choice']}`\n"
         f"🔹 **Final Filename:** `{final_output_name}`\n\n"
-        f"Type **Yes** to begin the process."
+        f"Do you want to begin the process?"
     )
-    await update.message.reply_text(summary, reply_markup=ReplyKeyboardRemove(), parse_mode='Markdown')
+    
+    # Add Confirmation Inline Buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes, Start", callback_data="yes"),
+            InlineKeyboardButton("Cancel", callback_data="cancel"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text=summary, reply_markup=reply_markup, parse_mode='Markdown')
     return CONFIRMATION
 
 async def process_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """The main worker function that executes the pipeline."""
-    if update.message.text.lower() != 'yes':
-        await update.message.reply_text("❌ Job cancelled.")
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'cancel':
+        await query.edit_message_text("❌ Job cancelled.")
         return ConversationHandler.END
 
     chat_id = update.effective_chat.id
-    status_message = await update.message.reply_text("🚀 Starting job... Initializing download.")
+    status_message = await query.edit_message_text("🚀 Starting job... Initializing download.")
     
     try:
         # --- 1. Download ---
@@ -288,7 +314,7 @@ async def process_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
-    await update.message.reply_text("Job cancelled.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Job cancelled.")
     return ConversationHandler.END
 
 def main() -> None:
@@ -305,8 +331,8 @@ def main() -> None:
         states={
             GET_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_url)],
             GET_ORIGINAL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_original_name)],
-            GET_QUALITY: [MessageHandler(filters.Regex("^(1080P|720P|480P)$"), get_quality)],
-            CONFIRMATION: [MessageHandler(filters.Regex("(?i)^yes$"), process_job)],
+            GET_QUALITY: [CallbackQueryHandler(get_quality, pattern="^(1080P|720P|480P)$")],
+            CONFIRMATION: [CallbackQueryHandler(process_job, pattern="^(yes|cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
