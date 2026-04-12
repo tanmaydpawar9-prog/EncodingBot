@@ -125,10 +125,23 @@ def get_target_bitrate(input_file, quality_choice):
 
 def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
     retries = 100
+    last_progress = -1
+    stuck_count = 0
+    
     for attempt in range(retries):
         current_start = start + progress_list[idx]
         if current_start > end:
             return
+            
+        if progress_list[idx] == last_progress:
+            stuck_count += 1
+            if stuck_count > 10:
+                logger.warning(f"Thread {idx} stuck at byte {current_start}. Assuming EOF ghost data.")
+                progress_list[idx] = (end - start) + 1
+                return
+        else:
+            stuck_count = 0
+            last_progress = progress_list[idx]
             
         headers = {
             "Range": f"bytes={current_start}-{end}", 
@@ -143,18 +156,30 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
                 raise Exception("Server ignored Range header, parallel download not supported.")
                 
             with open(output_path, "rb+") as f:
-                # Resume exactly where this specific thread left off
                 f.seek(current_start)
-                # 64KB chunks to ensure we save progress frequently before Heroku kills the connection
-                for chunk in res.iter_content(chunk_size=64*1024):
-                    if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-                        return
-                    if chunk:
-                        f.write(chunk)
-                        progress_list[idx] += len(chunk)
-                        if start + progress_list[idx] > end:
-                            break
-            return # Success
+                buffer = bytearray()
+                try:
+                    # 8KB chunks prevent data loss when exception is raised mid-stream
+                    for chunk in res.iter_content(chunk_size=8192):
+                        if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+                            return
+                        if chunk:
+                            buffer.extend(chunk)
+                            # Buffer to 1MB to prevent disk stuttering
+                            if len(buffer) >= 1024 * 1024:
+                                f.write(buffer)
+                                progress_list[idx] += len(buffer)
+                                buffer.clear()
+                            if start + progress_list[idx] + len(buffer) > end:
+                                break
+                finally:
+                    if buffer:
+                        f.write(buffer)
+                        progress_list[idx] += len(buffer)
+                        buffer.clear()
+                        
+            if start + progress_list[idx] > end:
+                return # Success
         except Exception as e:
             logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
             time.sleep(3)
