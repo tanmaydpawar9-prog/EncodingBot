@@ -7,6 +7,7 @@ import logging
 import asyncio
 import requests
 import concurrent.futures
+import uuid
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
@@ -256,6 +257,25 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             time.sleep(3)
             
     raise Exception(f"Download thread {idx} permanently failed after {retries} retries.")
+    
+def extract_thumbnail(video_path, thumb_path):
+    """Extracts a frame at the 1-second mark to use as the Telegram video thumbnail."""
+    cmd = [
+        'ffmpeg', '-y', '-i', video_path,
+        '-ss', '00:00:01',
+        '-vframes', '1',
+        '-vf', 'scale=320:-1',
+        '-q:v', '2',
+        thumb_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+async def delayed_delete(filepath, delay=7200):
+    """Deletes a file after a specific delay (default 2 hours)."""
+    await asyncio.sleep(delay)
+    if os.path.exists(filepath):
+        try: os.remove(filepath)
+        except Exception: pass
 
 async def download_video_from_url(url, output_path, progress_viewer):
     loop = asyncio.get_running_loop()
@@ -462,6 +482,7 @@ app = Client(
 # Memory storage for the conversation state
 user_sessions = {}
 active_jobs = {}
+os.makedirs("downloads", exist_ok=True)
 
 def is_allowed(user_id):
     allowed_user = os.getenv("ALLOWED_USER_ID")
@@ -477,8 +498,16 @@ async def start(client, message):
         
     await message.reply_text(
         "Welcome! I am a video encoding bot.\n"
-        "Reply to any video message with `/encode`, OR send `/encode <url>` to start a new job."
+        "Reply to any video message with `/encode`, OR send `/encode <url>` to start a new job.\n"
+        "To reuse a cached video, send `/log <video_id>`."
     )
+
+@app.on_message(filters.command("shutdown") & filters.private)
+async def shutdown_cmd(client, message):
+    if not is_allowed(message.from_user.id):
+        return
+    await message.reply_text("🛑 Shutting down Lightning AI server...")
+    deactivate_machine()
 
 @app.on_message(filters.command("encode") & filters.private)
 async def encode_command(client, message):
@@ -533,6 +562,43 @@ async def encode_command(client, message):
         f"✨ Found video: `{original_name}`\nPlease select the desired output quality.",
         reply_markup=keyboard
     )
+    
+@app.on_message(filters.command("log") & filters.private)
+async def log_command(client, message):
+    if not is_allowed(message.from_user.id):
+        return
+    if len(message.command) < 2:
+        await message.reply_text("⚠️ Usage: `/log <video_id>`")
+        return
+        
+    vid_id = message.command[1]
+    local_path = f"downloads/{vid_id}.mkv"
+    if not os.path.exists(local_path):
+        await message.reply_text("❌ Video not found on server. It may have expired and been deleted.")
+        return
+        
+    user_sessions[message.chat.id] = {
+        'source_type': 'local',
+        'vid_id': vid_id,
+        'message_to_reply': message.id,
+        'awaiting_name': True
+    }
+    await message.reply_text("📁 Video found in server cache! Please reply with the desired output filename (e.g. `MyVideo.mkv`):")
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
+async def text_handler(client, message):
+    chat_id = message.chat.id
+    if chat_id in user_sessions and user_sessions[chat_id].get('awaiting_name'):
+        original_name = message.text.strip()
+        if not "." in original_name:
+            original_name += ".mkv"
+        user_sessions[chat_id]['original_name'] = original_name
+        user_sessions[chat_id]['awaiting_name'] = False
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
+        ])
+        await message.reply_text(f"✨ Name set to: `{original_name}`\nPlease select the desired output quality.", reply_markup=keyboard)
 
 @app.on_callback_query(filters.regex(r"^qual_"))
 async def quality_callback(client, callback_query):
@@ -581,25 +647,37 @@ async def start_callback(client, callback_query):
     
     # Register active job
     active_jobs[chat_id] = {'cancel': False, 'process': None}
+    download_complete = False
     
     try:
-        local_input = "input_temp.mkv"
+        vid_id = session.get('vid_id', uuid.uuid4().hex[:8])
+        local_input = f"downloads/{vid_id}.mkv"
         final_output_name = session['final_output_name']
+        thumb_path = f"downloads/thumb_{vid_id}.jpg"
         
         # --- 1. Download ---
-        dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
-        if session['source_type'] == 'url':
-            await download_video_from_url(session['url'], local_input, dl_viewer)
-        else:
-            async def dl_progress(current, total):
-                await dl_viewer.update(current, total)
-            await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
+        if session['source_type'] != 'local':
+            dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
+            if session['source_type'] == 'url':
+                await download_video_from_url(session['url'], local_input, dl_viewer)
+            else:
+                async def dl_progress(current, total):
+                    await dl_viewer.update(current, total)
+                await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
+                
+            asyncio.create_task(delayed_delete(local_input, 7200)) # 2 Hour expiry timer
+            await client.send_message(chat_id, f"✅ Download complete!\n\n💾 **Video ID:** `{vid_id}`\n\nThis video is cached on the server for 2 hours. To encode it again into a different quality without re-downloading, use:\n`/log {vid_id}`")
             
-        await status_message.edit_text("✅ Download Complete! Starting encode...")
+        download_complete = True
+        await status_message.edit_text("✅ Ready! Starting encode...")
 
         # --- 2. Encode ---
         await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
-        await status_message.edit_text("✅ Encode Complete! Starting upload...")
+        
+        await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
+        extract_thumbnail(local_input, thumb_path)
+        
+        await status_message.edit_text("✅ Starting upload...")
 
         # --- 3. Upload (up to 2GB) ---
         ul_viewer = PyrogramProgressViewer(status_message, "Uploading", chat_id)
@@ -609,6 +687,7 @@ async def start_callback(client, callback_query):
         await client.send_document(
             chat_id, 
             document=final_output_name, 
+            thumb=thumb_path if os.path.exists(thumb_path) else None,
             reply_to_message_id=session['message_to_reply'],
             progress=ul_progress
         )
@@ -618,9 +697,15 @@ async def start_callback(client, callback_query):
             await status_message.delete()
         except Exception:
             pass
-
-        # --- 4. Shutdown to credits ---
-        deactivate_machine()
+        
+        # Ask the user if they want to shut down or keep going
+        power_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🛑 Shut Down Server", callback_data="power_off"),
+                InlineKeyboardButton("✅ Keep Alive (Reuse Video)", callback_data="power_on")
+            ]
+        ])
+        await client.send_message(chat_id, "🎉 Job complete! Do you want to shut down the Lightning AI server now to save credits?", reply_markup=power_keyboard)
         
     except Exception as e:
         if "User Cancelled" in str(e):
@@ -630,10 +715,12 @@ async def start_callback(client, callback_query):
             await status_message.edit_text(f"❌ Pipeline crashed: {e}")
     finally:
         active_jobs.pop(chat_id, None)
-        if os.path.exists("input_temp.mkv"):
-            os.remove("input_temp.mkv")
+        if not download_complete and os.path.exists(local_input):
+            os.remove(local_input) # Only delete if it crashed mid-download
         if 'final_output_name' in locals() and os.path.exists(final_output_name):
             os.remove(final_output_name)
+        if 'thumb_path' in locals() and os.path.exists(thumb_path):
+            os.remove(thumb_path)
 
 @app.on_callback_query(filters.regex(r"^cancel_job$"))
 async def cancel_job_callback(client, callback_query):
@@ -651,6 +738,18 @@ async def cancel_job_callback(client, callback_query):
                 pass
     else:
         await callback_query.answer("No active job to cancel.", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^power_"))
+async def power_callback(client, callback_query):
+    if not is_allowed(callback_query.from_user.id):
+        await callback_query.answer("❌ Access Denied.", show_alert=True)
+        return
+    action = callback_query.data.split("_")[1]
+    if action == "off":
+        await callback_query.edit_message_text("🛑 Shutting down Lightning AI server...")
+        deactivate_machine()
+    else:
+        await callback_query.edit_message_text("✅ Server kept alive. You can use `/shutdown` when you are finished.")
 
 if __name__ == "__main__":
     print("🌩️ Pyrogram Bot Starting. Waiting for Telegram connection...")
