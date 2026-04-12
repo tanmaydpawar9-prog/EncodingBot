@@ -89,6 +89,12 @@ def process_metadata(original_name, quality_choice):
     if new_name == original_name:
         base, ext = os.path.splitext(original_name)
         new_name = f"{base} [{quality_choice.upper()}]{ext}"
+        
+    # Prevent FFmpeg crash if user forgot to include the file extension
+    _, ext = os.path.splitext(new_name)
+    if not ext:
+        new_name += ".mp4"
+        
     return new_name
 
 def get_target_bitrate(input_file, quality_choice):
@@ -136,16 +142,24 @@ async def download_video(url, output_path, progress_viewer: TelegramProgressView
 async def encode_video(input_file, output_file, quality_choice):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
     target_bitrate = get_target_bitrate(input_file, quality_choice)
-    height = ''.join(filter(str.isdigit, quality_choice))
-    if not height: 
-        height = "1080"
         
+    # Map quality to fixed width, letting height auto-scale (-2)
+    qual = quality_choice.upper()
+    if '1080' in qual:
+        scale = '1920:-2'
+    elif '720' in qual:
+        scale = '1280:-2'
+    elif '480' in qual:
+        scale = '854:-2'
+    else:
+        scale = '1920:-2'
+
     print(f"\n[INFO] 🎬 Encoding to {quality_choice} (Target Bitrate: {target_bitrate//1000} kbps)...")
     
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
-        '-vf', f'scale=-2:{height}',
+        '-vf', f'scale={scale}',
         '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
         '-b:v', str(target_bitrate),
         '-c:a', 'copy',
