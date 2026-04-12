@@ -36,7 +36,15 @@ class PyrogramProgressViewer:
         if elapsed < 0.1: elapsed = 0.1
         
         speed = current / elapsed
-        progress_pct = (current / total) * 100 if total > 0 else 0
+        
+        if total > 0:
+            progress_pct = (current / total) * 100
+            eta_sec = (total - current) / speed if speed > 0 else 0
+            tot_mb_str = f"{total / 1048576:.1f}MB"
+        else:
+            progress_pct = 0
+            eta_sec = 0
+            tot_mb_str = "Unknown Size"
         
         # [■■■■■■□□□□] exact design match
         filled = int(progress_pct / 10)
@@ -44,9 +52,9 @@ class PyrogramProgressViewer:
         
         text = (
             f"Progress: [{bar}] {progress_pct:.1f}%\n"
-            f"⚙️ {self.action}: {current / 1048576:.1f}MB of {total / 1048576:.1f}MB\n"
+            f"⚙️ {self.action}: {current / 1048576:.1f}MB of {tot_mb_str}\n"
             f"⚡ Speed: {speed / 1048576:.1f}MB/s\n"
-            f"⌛ ETA: {time.strftime('%Hh %Mm %Ss', time.gmtime((total - current) / speed if speed > 0 else 0))}\n"
+            f"⌛ ETA: {time.strftime('%Hh %Mm %Ss', time.gmtime(eta_sec))}\n"
             f"⏱️ Time elapsed: {time.strftime('%Mm %Ss', time.gmtime(elapsed))}."
         )
         
@@ -69,10 +77,9 @@ def process_metadata(original_name, quality_choice):
         base, ext = os.path.splitext(original_name)
         new_name = f"{base} [{quality_choice.upper()}]{ext}"
         
-    # Prevent FFmpeg crash if user forgot to include the file extension
-    _, ext = os.path.splitext(new_name)
-    if not ext:
-        new_name += ".mp4"
+    # Force .mkv extension to support all streams and avoid weird MP4 containers
+    base, _ = os.path.splitext(new_name)
+    new_name = f"{base}.mkv"
         
     return new_name
 
@@ -270,7 +277,7 @@ async def start_callback(client, callback_query):
     status_message = await callback_query.edit_message_text("🚀 Starting job... Downloading from Telegram (this may take a moment)...")
     
     try:
-        local_input = "input_temp.mp4"
+        local_input = "input_temp.mkv"
         final_output_name = session['final_output_name']
         
         # --- 1. Download (up to 2GB) ---
@@ -305,8 +312,8 @@ async def start_callback(client, callback_query):
         logger.error(f"Pipeline failed: {e}", exc_info=True)
         await status_message.edit_text(f"❌ Pipeline crashed: {e}")
     finally:
-        if os.path.exists("input_temp.mp4"):
-            os.remove("input_temp.mp4")
+        if os.path.exists("input_temp.mkv"):
+            os.remove("input_temp.mkv")
         if 'final_output_name' in locals() and os.path.exists(final_output_name):
             os.remove(final_output_name)
 
