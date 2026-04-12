@@ -137,7 +137,7 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             with open(output_path, "rb+") as f:
                 # Resume exactly where this specific thread left off
                 f.seek(start + progress_list[idx])
-                for chunk in res.iter_content(chunk_size=1024*1024):
+                for chunk in res.iter_content(chunk_size=2*1024*1024):
                     if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                         return
                     if chunk:
@@ -174,7 +174,7 @@ async def download_video_from_url(url, output_path, progress_viewer):
         def _single_download():
             downloaded = 0
             with open(output_path, 'wb') as f:
-                for chunk in res.iter_content(chunk_size=1024*1024):
+                for chunk in res.iter_content(chunk_size=2*1024*1024):
                     if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                         raise Exception("User Cancelled")
                     if chunk:
@@ -192,7 +192,7 @@ async def download_video_from_url(url, output_path, progress_viewer):
     with open(output_path, "wb") as f:
         f.truncate(total_size) # Pre-allocate file on disk
         
-    num_threads = 4
+    num_threads = 8
     chunk_size = total_size // num_threads
     progress_list = [0] * num_threads
     
@@ -306,7 +306,7 @@ app = Client(
     api_id=API_ID, 
     api_hash=API_HASH, 
     bot_token=BOT_TOKEN,
-    max_concurrent_transmissions=3  # Stealth limit to bypass Telegram anti-spam 0.1MB/s throttle
+    max_concurrent_transmissions=8  # Safe optimized limit for Telegram
 )
 
 # Memory storage for the conversation state
