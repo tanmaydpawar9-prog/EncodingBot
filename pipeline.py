@@ -18,17 +18,22 @@ logger = logging.getLogger(__name__)
 # 1. Custom Progress Bar Formatting
 # ==========================================
 class PyrogramProgressViewer:
-    def __init__(self, message, action="Downloading"):
+    def __init__(self, message, action="Downloading", chat_id=None):
         self.message = message
         self.action = action
+        self.chat_id = chat_id
         self.start_time = time.time()
         self.last_update = 0
         self.last_text = ""
 
     async def update(self, current, total):
+        # Abort if user triggered the cancel button
+        if self.chat_id and active_jobs.get(self.chat_id, {}).get('cancel'):
+            raise Exception("User Cancelled")
+            
         now = time.time()
-        # Throttle updates to 2s to avoid hitting Telegram API rate limits
-        if now - self.last_update < 2 and current < total:
+        # Throttled to 5s to prevent spamming and uncap Pyrogram's download speed
+        if now - self.last_update < 5 and current < total:
             return
         self.last_update = now
         
@@ -37,7 +42,7 @@ class PyrogramProgressViewer:
         
         speed = current / elapsed
         
-        if total > 0:
+        if total and total > 0:
             progress_pct = (current / total) * 100
             eta_sec = (total - current) / speed if speed > 0 else 0
             tot_mb_str = f"{total / 1048576:.1f}MB"
@@ -60,7 +65,10 @@ class PyrogramProgressViewer:
         
         if text != self.last_text:
             try:
-                await self.message.edit_text(text)
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel Job", callback_data="cancel_job")]
+                ])
+                await self.message.edit_text(text, reply_markup=keyboard)
                 self.last_text = text
             except Exception:
                 pass
@@ -109,7 +117,7 @@ def get_target_bitrate(input_file, quality_choice):
 # Fast Download, Encode, and Upload 
 # ==========================================
 
-async def encode_video(input_file, output_file, quality_choice):
+async def encode_video(input_file, output_file, quality_choice, chat_id=None):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
     target_bitrate = get_target_bitrate(input_file, quality_choice)
         
@@ -139,14 +147,28 @@ async def encode_video(input_file, output_file, quality_choice):
     ]
     
     try:
-        # Run the blocking subprocess in a separate thread
-        process = await asyncio.to_thread(
-            subprocess.run, cmd_nvenc, check=True, capture_output=True, text=True
+        # Use asyncio subprocess so we can gracefully terminate FFmpeg if cancelled
+        process = await asyncio.create_subprocess_exec(
+            *cmd_nvenc,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+        
+        if chat_id and chat_id in active_jobs:
+            active_jobs[chat_id]['process'] = process
+            
+        stdout, stderr = await process.communicate()
+        
+        if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
+            raise Exception("User Cancelled")
+            
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg failed: {stderr.decode()}")
+            
         print("⚡ Encoding via RTX 6000 NVENC completed successfully!")
-    except subprocess.CalledProcessError as e:
-        print(f"⚠️ GPU Encoding Failed: {e}\nFFmpeg stderr: {e.stderr}")
-        print("Please ensure FFmpeg is installed and NVIDIA drivers are loaded.")
+    except Exception as e:
+        if "User Cancelled" not in str(e):
+            print(f"⚠️ GPU Encoding Failed: {e}")
         raise
 
 # ==========================================
@@ -179,6 +201,7 @@ app = Client("encoding_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOK
 
 # Memory storage for the conversation state
 user_sessions = {}
+active_jobs = {}
 
 def is_allowed(user_id):
     allowed_user = os.getenv("ALLOWED_USER_ID")
@@ -276,12 +299,15 @@ async def start_callback(client, callback_query):
     session = user_sessions.pop(chat_id)
     status_message = await callback_query.edit_message_text("🚀 Starting job... Downloading from Telegram (this may take a moment)...")
     
+    # Register active job
+    active_jobs[chat_id] = {'cancel': False, 'process': None}
+    
     try:
         local_input = "input_temp.mkv"
         final_output_name = session['final_output_name']
         
         # --- 1. Download (up to 2GB) ---
-        dl_viewer = PyrogramProgressViewer(status_message, "Downloading")
+        dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
         async def dl_progress(current, total):
             await dl_viewer.update(current, total)
             
@@ -289,11 +315,11 @@ async def start_callback(client, callback_query):
         await status_message.edit_text("✅ Download Complete! Starting encode...")
 
         # --- 2. Encode ---
-        await encode_video(local_input, final_output_name, session['quality'])
+        await encode_video(local_input, final_output_name, session['quality'], chat_id)
         await status_message.edit_text("✅ Encode Complete! Starting upload...")
 
         # --- 3. Upload (up to 2GB) ---
-        ul_viewer = PyrogramProgressViewer(status_message, "Uploading")
+        ul_viewer = PyrogramProgressViewer(status_message, "Uploading", chat_id)
         async def ul_progress(current, total):
             await ul_viewer.update(current, total)
             
@@ -309,13 +335,34 @@ async def start_callback(client, callback_query):
         deactivate_machine()
         
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
-        await status_message.edit_text(f"❌ Pipeline crashed: {e}")
+        if "User Cancelled" in str(e):
+            await status_message.edit_text("❌ Job was cancelled by the user.")
+        else:
+            logger.error(f"Pipeline failed: {e}", exc_info=True)
+            await status_message.edit_text(f"❌ Pipeline crashed: {e}")
     finally:
+        active_jobs.pop(chat_id, None)
         if os.path.exists("input_temp.mkv"):
             os.remove("input_temp.mkv")
         if 'final_output_name' in locals() and os.path.exists(final_output_name):
             os.remove(final_output_name)
+
+@app.on_callback_query(filters.regex(r"^cancel_job$"))
+async def cancel_job_callback(client, callback_query):
+    chat_id = callback_query.message.chat.id
+    if chat_id in active_jobs:
+        active_jobs[chat_id]['cancel'] = True
+        await callback_query.answer("Cancelling job... Please wait.", show_alert=True)
+        
+        # Kill FFmpeg if it's currently running
+        process = active_jobs[chat_id].get('process')
+        if process:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+    else:
+        await callback_query.answer("No active job to cancel.", show_alert=True)
 
 if __name__ == "__main__":
     print("🌩️ Pyrogram Bot Starting. Waiting for Telegram connection...")
