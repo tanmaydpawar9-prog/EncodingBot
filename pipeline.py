@@ -7,6 +7,7 @@ import logging
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 # --- Basic Bot Logging ---
 logging.basicConfig(
@@ -32,8 +33,8 @@ class PyrogramProgressViewer:
             raise Exception("User Cancelled")
             
         now = time.time()
-        # Throttled to 5s to prevent spamming and uncap Pyrogram's download speed
-        if now - self.last_update < 5 and current < total:
+        # Throttled to 15s to prevent hitting Telegram's strict rate limits
+        if now - self.last_update < 15 and current < total:
             return
         self.last_update = now
         
@@ -70,6 +71,9 @@ class PyrogramProgressViewer:
                 ])
                 await self.message.edit_text(text, reply_markup=keyboard)
                 self.last_text = text
+            except FloodWait as e:
+                # If Telegram rate-limits us, automatically pause to respect the limit
+                await asyncio.sleep(e.value)
             except Exception:
                 pass
 
