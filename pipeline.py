@@ -296,7 +296,7 @@ def main() -> None:
             GET_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_url)],
             GET_ORIGINAL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_original_name)],
             GET_QUALITY: [MessageHandler(filters.Regex("^(1080P|720P|480P)$"), get_quality)],
-            CONFIRMATION: [MessageHandler(filters.Regex("^(?i)yes$"), process_job)],
+            CONFIRMATION: [MessageHandler(filters.Regex("(?i)^yes$"), process_job)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
