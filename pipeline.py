@@ -130,22 +130,39 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
     }
     retries = 3
     for attempt in range(retries):
+        current_start = start + progress_list[idx]
+        if current_start > end:
+            return
+            
+        headers = {
+            "Range": f"bytes={current_start}-{end}", 
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
         try:
             # Strict timeout prevents the infinite 40s freezing
             res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(5, 15))
             res.raise_for_status()
+            
+            if res.status_code == 200:
+                raise Exception("Server ignored Range header, parallel download not supported.")
+                
             with open(output_path, "rb+") as f:
                 # Resume exactly where this specific thread left off
-                f.seek(start + progress_list[idx])
+                f.seek(current_start)
                 for chunk in res.iter_content(chunk_size=2*1024*1024):
                     if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                         return
                     if chunk:
                         f.write(chunk)
                         progress_list[idx] += len(chunk)
+                        if start + progress_list[idx] > end:
+                            break
             return # Success
         except requests.exceptions.RequestException as e:
             logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"Thread {idx} error: {e}")
             time.sleep(2)
             
     raise Exception(f"Download thread {idx} permanently failed.")
