@@ -132,7 +132,7 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
     res.raise_for_status()
     with open(output_path, "rb+") as f:
         f.seek(start)
-        for chunk in res.iter_content(chunk_size=1024*1024):
+        for chunk in res.iter_content(chunk_size=4*1024*1024):
             if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                 break
             if chunk:
@@ -295,7 +295,7 @@ app = Client(
     api_id=API_ID, 
     api_hash=API_HASH, 
     bot_token=BOT_TOKEN,
-    max_concurrent_transmissions=10  # Forces parallel downloads/uploads for maximum speed
+    max_concurrent_transmissions=15  # Forces parallel downloads/uploads for maximum speed
 )
 
 # Memory storage for the conversation state
@@ -451,7 +451,12 @@ async def start_callback(client, callback_query):
             reply_to_message_id=session['message_to_reply'],
             progress=ul_progress
         )
-        await status_message.edit_text("🎉 All operations finished securely.")
+        
+        # Clean up the chat by deleting the prompt/progress message!
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
 
         # --- 4. Shutdown to save credits ---
         deactivate_machine()
