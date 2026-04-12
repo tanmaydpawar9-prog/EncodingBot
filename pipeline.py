@@ -354,7 +354,7 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
-        '-map', '0:V?',            # Maps all video streams EXCEPT attached cover pictures (fixes mjpeg crashes)
+        '-map', '0:v:0',           # Maps ONLY the main video stream (forces FFmpeg to ignore broken MJPEG thumbnails)
         '-map', '0:a?',            # Maps all audio streams
         '-map', '0:s?',            # Maps all subtitle streams
         '-vf', f'scale={scale}',
