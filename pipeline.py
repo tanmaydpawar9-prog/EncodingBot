@@ -201,7 +201,13 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
     print("❌ ERROR: You must set API_ID, API_HASH, and BOT_TOKEN environment variables!")
     sys.exit(1)
 
-app = Client("encoding_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "encoding_bot", 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN,
+    max_concurrent_transmissions=10  # Forces parallel downloads/uploads for maximum speed
+)
 
 # Memory storage for the conversation state
 user_sessions = {}
