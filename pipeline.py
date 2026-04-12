@@ -123,12 +123,17 @@ def get_target_bitrate(input_file, quality_choice):
 # ==========================================
 
 async def download_video_from_url(url, output_path, progress_viewer):
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     response = await asyncio.to_thread(requests.get, url, stream=True, headers=headers, allow_redirects=True)
     
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError:
+        raise ValueError(f"Download failed: Server returned HTTP {response.status_code}.")
+
     content_type = response.headers.get('Content-Type', '')
-    if 'text/html' in content_type:
-        raise ValueError("URL points to a webpage, not a direct file.")
+    if 'text/' in content_type.lower():
+        raise ValueError(f"URL returned text/webpage ({content_type}), not a direct video file.")
         
     total_size = int(response.headers.get('content-length', 0))
     downloaded = 0
@@ -142,6 +147,12 @@ async def download_video_from_url(url, output_path, progress_viewer):
             f.write(chunk)
             downloaded += len(chunk)
             await progress_viewer.update(downloaded, total_size)
+            
+    # Sanity check: If the file is incredibly small, it's an error message, not a video.
+    if os.path.getsize(output_path) < 100 * 1024:  # Less than 100KB
+        with open(output_path, 'r', errors='ignore') as f:
+            snippet = f.read(200)
+        raise ValueError(f"Downloaded file is invalid or too small. Server response: {snippet}")
 
 async def encode_video(input_file, output_file, quality_choice, chat_id=None):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
