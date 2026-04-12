@@ -174,9 +174,21 @@ def get_video_duration(input_file):
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
     try:
-        return float(subprocess.check_output(cmd).decode().strip())
+        out = subprocess.check_output(cmd).decode().strip()
+        if out and out.lower() != 'n/a':
+            return float(out)
     except Exception:
-        return 0.0
+        pass
+        
+    # Fallback to video stream duration (specifically for MKV files)
+    cmd_stream = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
+    try:
+        out = subprocess.check_output(cmd_stream).decode().strip()
+        if out and out.lower() != 'n/a':
+            return float(out.split('\n')[0])
+    except Exception:
+        pass
+    return 0.0
 
 # ==========================================
 # Fast Download, Encode, and Upload 
@@ -342,7 +354,9 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
-        '-map', '0',               # Maps all streams (video, multiple audio, subtitles)
+        '-map', '0:V?',            # Maps all video streams EXCEPT attached cover pictures (fixes mjpeg crashes)
+        '-map', '0:a?',            # Maps all audio streams
+        '-map', '0:s?',            # Maps all subtitle streams
         '-vf', f'scale={scale}',
         '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
         '-b:v', str(target_bitrate),
@@ -379,7 +393,7 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
             if len(stderr_buffer) > 10:
                 stderr_buffer.pop(0)
                 
-            if viewer and total_duration > 0:
+            if viewer:
                 time_match = time_pattern.search(line_str)
                 if time_match:
                     h, m, s = time_match.groups()
