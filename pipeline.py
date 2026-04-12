@@ -5,6 +5,7 @@ import re
 import subprocess
 import logging
 import asyncio
+import requests
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
@@ -33,8 +34,8 @@ class PyrogramProgressViewer:
             raise Exception("User Cancelled")
             
         now = time.time()
-        # Throttled to 15s to prevent hitting Telegram's strict rate limits
-        if now - self.last_update < 15 and current < total:
+        # Throttled to 5s for faster updates (FloodWait handler protects against crashes)
+        if now - self.last_update < 5 and current < total:
             return
         self.last_update = now
         
@@ -120,6 +121,27 @@ def get_target_bitrate(input_file, quality_choice):
 # ==========================================
 # Fast Download, Encode, and Upload 
 # ==========================================
+
+async def download_video_from_url(url, output_path, progress_viewer):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = await asyncio.to_thread(requests.get, url, stream=True, headers=headers, allow_redirects=True)
+    
+    content_type = response.headers.get('Content-Type', '')
+    if 'text/html' in content_type:
+        raise ValueError("URL points to a webpage, not a direct file.")
+        
+    total_size = int(response.headers.get('content-length', 0))
+    downloaded = 0
+    
+    iterator = response.iter_content(chunk_size=1024*1024)
+    with open(output_path, 'wb') as f:
+        while True:
+            chunk = await asyncio.to_thread(next, iterator, None)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            await progress_viewer.update(downloaded, total_size)
 
 async def encode_video(input_file, output_file, quality_choice, chat_id=None):
     """Runs FFmpeg in a separate thread to avoid blocking the bot."""
@@ -227,7 +249,7 @@ async def start(client, message):
         
     await message.reply_text(
         "Welcome! I am a video encoding bot.\n"
-        "Reply to any video message with the /encode command to start a new job."
+        "Reply to any video message with `/encode`, OR send `/encode <url>` to start a new job."
     )
 
 @app.on_message(filters.command("encode") & filters.private)
@@ -236,20 +258,40 @@ async def encode_command(client, message):
         await message.reply_text("❌ Access Denied.")
         return
 
-    reply = message.reply_to_message
-    if not reply or not (reply.video or reply.document):
-        await message.reply_text("⚠️ Please reply directly to a video message with /encode.")
-        return
-        
-    media = reply.video or reply.document
-    file_id = media.file_id
-    original_name = getattr(media, 'file_name', 'video.mp4') or 'video.mp4'
+    # Check if a URL was provided
+    if len(message.command) > 1:
+        url = message.text.split(maxsplit=1)[1]
+        if url.startswith("http"):
+            original_name = url.split("/")[-1].split("?")[0]
+            if not original_name or "." not in original_name:
+                original_name = "video.mkv"
+                
+            user_sessions[message.chat.id] = {
+                'source_type': 'url',
+                'url': url,
+                'original_name': original_name,
+                'message_to_reply': message.id
+            }
+        else:
+            await message.reply_text("⚠️ Please provide a valid HTTP/HTTPS URL.")
+            return
+    else:
+        # Check if it's a reply
+        reply = message.reply_to_message
+        if not reply or not (reply.video or reply.document):
+            await message.reply_text("⚠️ Please reply directly to a video message with /encode, OR send /encode <url>.")
+            return
+            
+        media = reply.video or reply.document
+        file_id = media.file_id
+        original_name = getattr(media, 'file_name', 'video.mkv') or 'video.mkv'
 
-    user_sessions[message.chat.id] = {
-        'file_id': file_id,
-        'original_name': original_name,
-        'message_to_reply': reply.id
-    }
+        user_sessions[message.chat.id] = {
+            'source_type': 'telegram',
+            'file_id': file_id,
+            'original_name': original_name,
+            'message_to_reply': reply.id
+        }
     
     keyboard = InlineKeyboardMarkup([
         [
@@ -279,7 +321,7 @@ async def quality_callback(client, callback_query):
 
     summary = (
         f"Okay, here is the plan:\n\n"
-        f"🔹 **Source:** `Telegram Message Reply`\n"
+        f"🔹 **Source:** `{'URL Link' if user_sessions[chat_id]['source_type'] == 'url' else 'Telegram Message'}`\n"
         f"🔹 **Output Quality:** `{quality}`\n"
         f"🔹 **Final Filename:** `{final_output_name}`\n\n"
         f"Do you want to begin the process?"
@@ -316,12 +358,15 @@ async def start_callback(client, callback_query):
         local_input = "input_temp.mkv"
         final_output_name = session['final_output_name']
         
-        # --- 1. Download (up to 2GB) ---
+        # --- 1. Download ---
         dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
-        async def dl_progress(current, total):
-            await dl_viewer.update(current, total)
+        if session['source_type'] == 'url':
+            await download_video_from_url(session['url'], local_input, dl_viewer)
+        else:
+            async def dl_progress(current, total):
+                await dl_viewer.update(current, total)
+            await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
             
-        await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
         await status_message.edit_text("✅ Download Complete! Starting encode...")
 
         # --- 2. Encode ---
