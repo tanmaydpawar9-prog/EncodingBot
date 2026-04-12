@@ -124,7 +124,7 @@ def get_target_bitrate(input_file, quality_choice):
 # ==========================================
 
 def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
-    retries = 10
+    retries = 100
     for attempt in range(retries):
         current_start = start + progress_list[idx]
         if current_start > end:
@@ -145,8 +145,8 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             with open(output_path, "rb+") as f:
                 # Resume exactly where this specific thread left off
                 f.seek(current_start)
-                # 1MB chunks to ensure we save progress frequently if Heroku kills the connection
-                for chunk in res.iter_content(chunk_size=1024*1024):
+                # 64KB chunks to ensure we save progress frequently before Heroku kills the connection
+                for chunk in res.iter_content(chunk_size=64*1024):
                     if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                         return
                     if chunk:
