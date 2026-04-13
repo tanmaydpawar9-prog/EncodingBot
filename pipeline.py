@@ -377,7 +377,7 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
         '-map', '0:v:0',           # Maps ONLY the main video stream (forces FFmpeg to ignore broken MJPEG thumbnails)
         '-map', '0:a?',            # Maps all audio streams
         '-map', '0:s?',            # Maps all subtitle streams
-        '-vf', f'scale={scale}',
+        '-vf', f'scale_cuda={scale}',
         '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
         '-b:v', str(target_bitrate),
         '-c:a', 'copy',            # Copies all audio streams without re-encoding
@@ -492,7 +492,7 @@ ul_semaphore = asyncio.Semaphore(2)  # Max concurrent uploads
 
 def is_allowed(user_id):
     allowed_user = os.getenv("ALLOWED_USER_ID")
-    if allowed_user and str(user_id) != allowed_user:
+    if allowed_user and str(user_id).strip() != allowed_user.strip():
         return False
     return True
 
@@ -585,7 +585,7 @@ async def log_command(client, message):
     }
     await message.reply_text("📁 Video found in server cache!\nPlease reply with the desired output filename (or type `/skip` to use default):")
 
-@app.on_message((filters.text | filters.photo) & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
+@app.on_message((filters.text | filters.photo | filters.document | filters.video) & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
 async def meta_handler(client, message):
     chat_id = message.chat.id
     if chat_id not in user_sessions:
@@ -594,28 +594,36 @@ async def meta_handler(client, message):
     session = user_sessions[chat_id]
     
     if session.get('awaiting_name'):
-        if message.text and message.text.strip().lower() != '/skip':
+        if not message.text:
+            await message.reply_text("⚠️ I'm waiting for a filename as text. Please reply with the desired output filename (or type `/skip`).")
+            return
+
+        if message.text.strip().lower() != '/skip':
             new_name = message.text.strip()
             if not "." in new_name:
                 new_name += ".mkv"
             session['original_name'] = new_name
-            
+
         session['awaiting_name'] = False
         session['awaiting_thumbnail'] = True
         await message.reply_text("🖼️ Please send a custom thumbnail photo (or type `/skip` to auto-extract one):")
         return
         
-    if session.get('awaiting_thumbnail'):
+    elif session.get('awaiting_thumbnail'):
+        if message.text and message.text.strip().lower() == '/cancel':
+            del user_sessions[chat_id]
+            await message.reply_text("❌ Operation cancelled.")
+            return
+
         if message.photo:
             session['custom_thumb'] = message.photo.file_id
-        elif message.text and message.text.strip().lower() != '/skip':
-            await message.reply_text("⚠️ Please send a PHOTO, or type `/skip`.")
-            return
-        else:
+        elif message.text and message.text.strip().lower() == '/skip':
             session['custom_thumb'] = None
-            
+        else:
+            await message.reply_text("⚠️ Please send a compressed PHOTO (not a file/document), or type `/cancel` to abort.")
+            return
+
         session['awaiting_thumbnail'] = False
-        
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
         ])
