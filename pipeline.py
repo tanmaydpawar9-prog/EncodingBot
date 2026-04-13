@@ -493,10 +493,13 @@ mux_semaphore = asyncio.Semaphore(1) # Max concurrent GPU encodes (prevents cras
 ul_semaphore = asyncio.Semaphore(2)  # Max concurrent uploads
 
 def is_allowed(user_id):
+    if not user_id:
+        return False
     allowed_user = os.getenv("ALLOWED_USER_ID")
     if allowed_user:
-        allowed_user = allowed_user.strip().strip('"').strip("'")
-        if str(user_id).strip() != allowed_user:
+        # Support multiple users separated by commas (e.g., "12345, 67890")
+        allowed_users = [u.strip().strip('"').strip("'") for u in allowed_user.split(',')]
+        if str(user_id).strip() not in allowed_users:
             return False
     return True
 
@@ -603,9 +606,14 @@ async def meta_handler(client, message):
             return
         session['last_media_group_id'] = message.media_group_id
 
+    now = time.time()
+
     if session.get('awaiting_name'):
         if not message.text:
-            await message.reply_text("⚠️ I'm waiting for a filename as text. Please reply with the desired output filename (or type `/skip`).")
+            # Debounce: Only send the error message if we haven't sent one in the last 2 seconds
+            if now - session.get('last_error_time', 0) > 2:
+                await message.reply_text("⚠️ I'm waiting for a filename as text. Please reply with the desired output filename, or type `/cancel` to abort.")
+                session['last_error_time'] = now
             return
 
         if message.text.strip().lower() != '/skip':
@@ -630,7 +638,9 @@ async def meta_handler(client, message):
         elif message.text and message.text.strip().lower() == '/skip':
             session['custom_thumb'] = None
         else:
-            await message.reply_text("⚠️ Please send a compressed PHOTO (not a file/document), or type `/cancel` to abort.")
+            if now - session.get('last_error_time', 0) > 2:
+                await message.reply_text("⚠️ Please send a compressed PHOTO (not a file/document), or type `/cancel` to abort.")
+                session['last_error_time'] = now
             return
 
         session['awaiting_thumbnail'] = False
