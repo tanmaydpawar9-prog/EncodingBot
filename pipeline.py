@@ -484,6 +484,12 @@ user_sessions = {}
 active_jobs = {}
 os.makedirs("downloads", exist_ok=True)
 
+# --- Pipeline Concurrency Controls ---
+# Semaphores to allow processing different files at different stages concurrently
+dl_semaphore = asyncio.Semaphore(2)  # Max concurrent downloads
+mux_semaphore = asyncio.Semaphore(1) # Max concurrent GPU encodes (prevents crashing)
+ul_semaphore = asyncio.Semaphore(2)  # Max concurrent uploads
+
 def is_allowed(user_id):
     allowed_user = os.getenv("ALLOWED_USER_ID")
     if allowed_user and str(user_id) != allowed_user:
@@ -659,7 +665,7 @@ async def start_callback(client, callback_query):
         return
 
     session = user_sessions.pop(chat_id)
-    status_message = await callback_query.edit_message_text("🚀 Starting job... Downloading from Telegram (this may take a moment)...")
+    status_message = await callback_query.edit_message_text("⏳ Queuing job...")
     
     # Register active job
     active_jobs[chat_id] = {'cancel': False, 'process': None}
@@ -673,44 +679,61 @@ async def start_callback(client, callback_query):
         
         # --- 1. Download ---
         if session['source_type'] != 'local':
-            dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
-            if session['source_type'] == 'url':
-                await download_video_from_url(session['url'], local_input, dl_viewer)
-            else:
-                async def dl_progress(current, total):
-                    await dl_viewer.update(current, total)
-                await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
+            await status_message.edit_text("⏳ Waiting for a download slot in the pipeline...")
+            async with dl_semaphore:
+                if active_jobs.get(chat_id, {}).get('cancel'):
+                    raise Exception("User Cancelled")
                 
-            asyncio.create_task(delayed_delete(local_input, 7200)) # 2 Hour expiry timer
-            await client.send_message(chat_id, f"✅ Download complete!\n\n💾 **Video ID:** `{vid_id}`\n\nThis video is cached on the server for 2 hours. To encode it again into a different quality without re-downloading, use:\n`/log {vid_id}`")
+                await status_message.edit_text("🚀 Starting download...")
+                dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
+                if session['source_type'] == 'url':
+                    await download_video_from_url(session['url'], local_input, dl_viewer)
+                else:
+                    async def dl_progress(current, total):
+                        await dl_viewer.update(current, total)
+                    await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
+                
+                asyncio.create_task(delayed_delete(local_input, 7200)) # 2 Hour expiry timer
+                await client.send_message(chat_id, f"✅ Download complete!\n\n💾 **Video ID:** `{vid_id}`\n\nThis video is cached on the server for 2 hours. To encode it again into a different quality without re-downloading, use:\n`/log {vid_id}`")
+        else:
+            await status_message.edit_text("✅ Local cache ready!")
             
         download_complete = True
-        await status_message.edit_text("✅ Ready! Starting encode...")
 
-        # --- 2. Encode ---
-        await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
+        # --- 2. Encode / Mux ---
+        await status_message.edit_text("⏳ Waiting for a GPU encoding (mux) slot...")
+        async with mux_semaphore:
+            if active_jobs.get(chat_id, {}).get('cancel'):
+                raise Exception("User Cancelled")
+                
+            await status_message.edit_text("✅ Ready! Starting encode...")
+            await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
         
-        if session.get('custom_thumb'):
-            await status_message.edit_text("✅ Encode Complete! Downloading custom thumbnail...")
-            await client.download_media(session['custom_thumb'], file_name=thumb_path)
-        else:
-            await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
-            extract_thumbnail(local_input, thumb_path)
-        
-        await status_message.edit_text("✅ Starting upload...")
+            if session.get('custom_thumb'):
+                await status_message.edit_text("✅ Encode Complete! Downloading custom thumbnail...")
+                await client.download_media(session['custom_thumb'], file_name=thumb_path)
+            else:
+                await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
+                extract_thumbnail(local_input, thumb_path)
 
         # --- 3. Upload (up to 2GB) ---
-        ul_viewer = PyrogramProgressViewer(status_message, "Uploading", chat_id)
-        async def ul_progress(current, total):
-            await ul_viewer.update(current, total)
-            
-        await client.send_document(
-            chat_id, 
-            document=final_output_name, 
-            thumb=thumb_path if os.path.exists(thumb_path) else None,
-            reply_to_message_id=session['message_to_reply'],
-            progress=ul_progress
-        )
+        await status_message.edit_text("⏳ Waiting for an upload slot...")
+        async with ul_semaphore:
+            if active_jobs.get(chat_id, {}).get('cancel'):
+                raise Exception("User Cancelled")
+                
+            await status_message.edit_text("✅ Starting upload...")
+            ul_viewer = PyrogramProgressViewer(status_message, "Uploading", chat_id)
+            async def ul_progress(current, total):
+                await ul_viewer.update(current, total)
+                
+            await client.send_document(
+                chat_id, 
+                document=final_output_name, 
+                thumb=thumb_path if os.path.exists(thumb_path) else None,
+                reply_to_message_id=session['message_to_reply'],
+                progress=ul_progress
+            )
         
         # Clean up the chat by deleting the prompt/progress message!
         try:
