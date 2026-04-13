@@ -606,6 +606,10 @@ async def meta_handler(client, message):
             return
         session['last_media_group_id'] = message.media_group_id
 
+    # Ignore Userbot/PM-guard auto-replies that break the bot's conversation flow
+    if message.text and "Access denied" in message.text:
+        return
+
     now = time.time()
 
     if session.get('awaiting_name'):
