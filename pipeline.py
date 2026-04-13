@@ -160,13 +160,15 @@ def get_target_bitrate(input_file, quality_choice):
     qual = quality_choice.upper()
     
     if '1080' in qual:
-        return int(original_bitrate * 0.5)
+        br = int(original_bitrate * 0.5)
     elif '720' in qual:
-        return int(original_bitrate * 0.25)
+        br = int(original_bitrate * 0.25)
     elif '480' in qual:
-        return int(original_bitrate * 0.125)
+        br = int(original_bitrate * 0.125)
+    else:
+        br = original_bitrate
     
-    return original_bitrate
+    return max(br, 500_000) # Prevents NVENC from crashing with a 0 or extremely low bitrate
 
 def get_video_duration(input_file):
     """Gets the total duration of the video in seconds."""
@@ -377,7 +379,7 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
         '-map', '0:v:0',           # Maps ONLY the main video stream (forces FFmpeg to ignore broken MJPEG thumbnails)
         '-map', '0:a?',            # Maps all audio streams
         '-map', '0:s?',            # Maps all subtitle streams
-        '-vf', f'scale_cuda={scale}',
+        '-vf', f'scale={scale},format=yuv420p', # Ensure 8-bit YUV420p to fix NVENC invalid param 8
         '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
         '-b:v', str(target_bitrate),
         '-c:a', 'copy',            # Copies all audio streams without re-encoding
@@ -492,8 +494,10 @@ ul_semaphore = asyncio.Semaphore(2)  # Max concurrent uploads
 
 def is_allowed(user_id):
     allowed_user = os.getenv("ALLOWED_USER_ID")
-    if allowed_user and str(user_id).strip() != allowed_user.strip():
-        return False
+    if allowed_user:
+        allowed_user = allowed_user.strip().strip('"').strip("'")
+        if str(user_id).strip() != allowed_user:
+            return False
     return True
 
 @app.on_message(filters.command("start") & filters.private)
@@ -593,6 +597,12 @@ async def meta_handler(client, message):
         
     session = user_sessions[chat_id]
     
+    # Prevent spam if the user forwards an album (multiple photos/videos at once)
+    if message.media_group_id:
+        if session.get('last_media_group_id') == message.media_group_id:
+            return
+        session['last_media_group_id'] = message.media_group_id
+
     if session.get('awaiting_name'):
         if not message.text:
             await message.reply_text("⚠️ I'm waiting for a filename as text. Please reply with the desired output filename (or type `/skip`).")
