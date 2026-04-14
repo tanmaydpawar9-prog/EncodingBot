@@ -157,10 +157,15 @@ def get_target_bitrate(input_file, quality_choice):
         'ffprobe', '-v', 'error', '-show_entries', 'format=bit_rate', 
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
+    original_bitrate = 16_000_000
     try:
-        original_bitrate = int(subprocess.check_output(cmd).decode().strip())
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        if res.stdout:
+            out = res.stdout.strip()
+            if out and out.lower() != 'n/a':
+                original_bitrate = int(out)
     except Exception:
-        original_bitrate = 16_000_000
+        pass
 
     qual = quality_choice.upper()
     
@@ -182,18 +187,22 @@ def get_video_duration(input_file):
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
     try:
-        out = subprocess.check_output(cmd).decode().strip()
-        if out and out.lower() != 'n/a':
-            return float(out)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        if res.stdout:
+            out = res.stdout.strip()
+            if out and out.lower() != 'n/a':
+                return float(out)
     except Exception:
         pass
         
     # Fallback to video stream duration (specifically for MKV files)
     cmd_stream = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
     try:
-        out = subprocess.check_output(cmd_stream).decode().strip()
-        if out and out.lower() != 'n/a':
-            return float(out.split('\n')[0])
+        res = subprocess.run(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        if res.stdout:
+            out = res.stdout.strip()
+            if out and out.lower() != 'n/a':
+                return float(out.split('\n')[0])
     except Exception:
         pass
     return 0.0
@@ -380,7 +389,7 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
     
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
-        'ffmpeg', '-y', '-i', input_file,
+        'ffmpeg', '-y', '-loglevel', 'error', '-stats', '-i', input_file,
         '-map', '0:v:0',           # Maps ONLY the main video stream (avoids broken thumbnails)
         '-map', '0:a?',            # Maps all audio streams
         '-map', '0:s?',            # Maps all subtitle streams
@@ -415,11 +424,19 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
         
         stderr_buffer = []
         while True:
-            line = await process.stderr.readline()
+            try:
+                # FFmpeg separates progress updates with \r instead of \n
+                line = await process.stderr.readuntil(b'\r')
+            except asyncio.exceptions.IncompleteReadError as e:
+                line = e.partial
+                
             if not line:
                 break
                 
             line_str = line.decode('utf-8', errors='ignore').strip()
+            if not line_str:
+                continue
+                
             stderr_buffer.append(line_str)
             if len(stderr_buffer) > 10:
                 stderr_buffer.pop(0)
@@ -657,70 +674,37 @@ async def meta_handler(client, message):
             return
 
         session['awaiting_thumbnail'] = False
-        if session['source_type'] in ['url', 'local']:
-            source_map = {
-                'url': 'URL Link',
-                'local': f"Cached Video (`{session.get('vid_id')}`)"
-            }
-            source_text = source_map.get(session['source_type'], 'Unknown')
-            summary = (
-                f"Okay, here is the plan:\n\n"
-                f"🔹 **Source:** `{source_text}`\n"
-                f"🔹 **Base Filename:** `{session['original_name']}`\n"
-                f"🔹 **Output Qualities:** `1080P, 720P, 480P`\n\n"
-                f"This will generate three separate video files. Do you want to begin the process?"
-            )
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("Yes, Start", callback_data="start_yes"),
-                    InlineKeyboardButton("Cancel", callback_data="start_cancel"),
-                ]
-            ])
-            await message.reply_text(summary, reply_markup=keyboard)
-        else:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
-            ])
-            await message.reply_text(f"✨ Name set to: `{session['original_name']}`\nPlease select the desired output quality.", reply_markup=keyboard)
-        return
-
-@app.on_callback_query(filters.regex(r"^qual_"))
-async def quality_callback(client, callback_query):
-    chat_id = callback_query.message.chat.id
-    if chat_id not in user_sessions:
-        await callback_query.answer("Session expired. Please send /encode again.", show_alert=True)
-        return
         
-    quality = callback_query.data.split("_")[1]
-    user_sessions[chat_id]['quality'] = quality
-    
-    final_output_name = process_metadata(user_sessions[chat_id]['original_name'], quality)
-    user_sessions[chat_id]['final_output_name'] = final_output_name
+        source_map = {
+            'url': 'URL Link',
+            'local': f"Cached Video (`{session.get('vid_id')}`)",
+            'telegram': 'Telegram Message'
+        }
+        source_text = source_map.get(session['source_type'], 'Unknown')
+        
+        # Pre-calculate to show the user exactly what the final names will be
+        name_1080 = process_metadata(session['original_name'], "1080P")
+        name_720 = process_metadata(session['original_name'], "720P")
+        name_480 = process_metadata(session['original_name'], "480P")
 
-    source_type = user_sessions[chat_id]['source_type']
-    if source_type == 'url':
-        source_text = 'URL Link'
-    elif source_type == 'local':
-        source_text = f"Cached Video (`{user_sessions[chat_id].get('vid_id')}`)"
-    else:
-        source_text = 'Telegram Message'
-
-    summary = (
-        f"Okay, here is the plan:\n\n"
-        f"🔹 **Source:** `{'URL Link' if user_sessions[chat_id]['source_type'] == 'url' else 'Telegram Message'}`\n"
-        f"🔹 **Source:** `{source_text}`\n"
-        f"🔹 **Output Quality:** `{quality}`\n"
-        f"🔹 **Final Filename:** `{final_output_name}`\n\n"
-        f"Do you want to begin the process?"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes, Start", callback_data="start_yes"),
-            InlineKeyboardButton("Cancel", callback_data="start_cancel"),
-        ]
-    ])
-    await callback_query.edit_message_text(summary, reply_markup=keyboard)
+        summary = (
+            f"Okay, here is the plan:\n\n"
+            f"🔹 **Source:** `{source_text}`\n"
+            f"🔹 **Base Filename:** `{session['original_name']}`\n\n"
+            f"🔹 **Output Files:**\n"
+            f"  `{name_1080}`\n"
+            f"  `{name_720}`\n"
+            f"  `{name_480}`\n\n"
+            f"This will generate three separate video files. Do you want to begin the process?"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Yes, Start", callback_data="start_yes"),
+                InlineKeyboardButton("Cancel", callback_data="start_cancel"),
+            ]
+        ])
+        await message.reply_text(summary, reply_markup=keyboard)
+        return
 
 @app.on_callback_query(filters.regex(r"^start_"))
 async def start_callback(client, callback_query):
@@ -783,14 +767,11 @@ async def start_callback(client, callback_query):
             extract_thumbnail(local_input, thumb_path)
 
         # Determine qualities to encode
-        if session.get('quality'):
-            qualities_to_encode = [(session['quality'], session['final_output_name'])]
-        else:
-            qualities_to_encode = [
-                ("1080P", process_metadata(session['original_name'], "1080P")),
-                ("720P", process_metadata(session['original_name'], "720P")),
-                ("480P", process_metadata(session['original_name'], "480P")),
-            ]
+        qualities_to_encode = [
+            ("1080P", process_metadata(session['original_name'], "1080P")),
+            ("720P", process_metadata(session['original_name'], "720P")),
+            ("480P", process_metadata(session['original_name'], "480P")),
+        ]
 
         async def process_quality(quality, final_output_name):
             q_status = await client.send_message(chat_id, f"⏳ Queuing {quality} version...")
