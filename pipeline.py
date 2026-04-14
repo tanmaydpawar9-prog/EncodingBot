@@ -648,10 +648,26 @@ async def meta_handler(client, message):
             return
 
         session['awaiting_thumbnail'] = False
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
-        ])
-        await message.reply_text(f"✨ Name set to: `{session['original_name']}`\nPlease select the desired output quality.", reply_markup=keyboard)
+        if session['source_type'] == 'url':
+            summary = (
+                f"Okay, here is the plan:\n\n"
+                f"🔹 **Source:** `URL Link`\n"
+                f"🔹 **Base Filename:** `{session['original_name']}`\n"
+                f"🔹 **Output Qualities:** `1080P, 720P, 480P`\n\n"
+                f"This will generate three separate video files. Do you want to begin the process?"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Yes, Start", callback_data="start_yes"),
+                    InlineKeyboardButton("Cancel", callback_data="start_cancel"),
+                ]
+            ])
+            await message.reply_text(summary, reply_markup=keyboard)
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("1080P", callback_data="qual_1080P"), InlineKeyboardButton("720P", callback_data="qual_720P"), InlineKeyboardButton("480P", callback_data="qual_480P")]
+            ])
+            await message.reply_text(f"✨ Name set to: `{session['original_name']}`\nPlease select the desired output quality.", reply_markup=keyboard)
         return
 
 @app.on_callback_query(filters.regex(r"^qual_"))
@@ -703,10 +719,13 @@ async def start_callback(client, callback_query):
     active_jobs[chat_id] = {'cancel': False, 'process': None}
     download_complete = False
     
+    local_input = None
+    thumb_path = None
+    encoded_files_to_cleanup = []
+    
     try:
         vid_id = session.get('vid_id', uuid.uuid4().hex[:8])
         local_input = f"downloads/{vid_id}.mkv"
-        final_output_name = session['final_output_name']
         thumb_path = f"downloads/thumb_{vid_id}.jpg"
         
         # --- 1. Download ---
@@ -732,40 +751,56 @@ async def start_callback(client, callback_query):
             
         download_complete = True
 
-        # --- 2. Encode / Mux ---
-        await status_message.edit_text("⏳ Waiting for a GPU encoding (mux) slot...")
-        async with mux_semaphore:
-            if active_jobs.get(chat_id, {}).get('cancel'):
-                raise Exception("User Cancelled")
-                
-            await status_message.edit_text("✅ Ready! Starting encode...")
-            await encode_video(local_input, final_output_name, session['quality'], chat_id, status_message)
-        
-            if session.get('custom_thumb'):
-                await status_message.edit_text("✅ Encode Complete! Downloading custom thumbnail...")
-                await client.download_media(session['custom_thumb'], file_name=thumb_path)
-            else:
-                await status_message.edit_text("✅ Encode Complete! Extracting thumbnail...")
-                extract_thumbnail(local_input, thumb_path)
+        # --- Thumbnail ---
+        if session.get('custom_thumb'):
+            await status_message.edit_text("✅ Download Complete! Downloading custom thumbnail...")
+            await client.download_media(session['custom_thumb'], file_name=thumb_path)
+        else:
+            await status_message.edit_text("✅ Download Complete! Extracting thumbnail...")
+            extract_thumbnail(local_input, thumb_path)
 
-        # --- 3. Upload (up to 2GB) ---
-        await status_message.edit_text("⏳ Waiting for an upload slot...")
-        async with ul_semaphore:
+        # Determine qualities to encode
+        if session.get('quality'):
+            qualities_to_encode = [(session['quality'], session['final_output_name'])]
+        else:
+            qualities_to_encode = [
+                ("1080P", process_metadata(session['original_name'], "1080P")),
+                ("720P", process_metadata(session['original_name'], "720P")),
+                ("480P", process_metadata(session['original_name'], "480P")),
+            ]
+
+        for quality, final_output_name in qualities_to_encode:
+            encoded_files_to_cleanup.append(final_output_name)
             if active_jobs.get(chat_id, {}).get('cancel'):
                 raise Exception("User Cancelled")
+
+            # --- 2. Encode ---
+            await status_message.edit_text(f"⏳ Waiting for GPU to encode {quality} version...")
+            async with mux_semaphore:
+                if active_jobs.get(chat_id, {}).get('cancel'):
+                    raise Exception("User Cancelled")
                 
-            await status_message.edit_text("✅ Starting upload...")
-            ul_viewer = PyrogramProgressViewer(status_message, "Uploading", chat_id)
-            async def ul_progress(current, total):
-                await ul_viewer.update(current, total)
+                await status_message.edit_text(f"🎬 Encoding {quality} version...")
+                await encode_video(local_input, final_output_name, quality, chat_id, status_message)
+            
+            # --- 3. Upload ---
+            await status_message.edit_text(f"⏳ Waiting to upload {quality} version...")
+            async with ul_semaphore:
+                if active_jobs.get(chat_id, {}).get('cancel'):
+                    raise Exception("User Cancelled")
                 
-            await client.send_document(
-                chat_id, 
-                document=final_output_name, 
-                thumb=thumb_path if os.path.exists(thumb_path) else None,
-                reply_to_message_id=session['message_to_reply'],
-                progress=ul_progress
-            )
+                await status_message.edit_text(f"🚀 Uploading {quality} version...")
+                ul_viewer = PyrogramProgressViewer(status_message, f"Uploading {quality}", chat_id)
+                async def ul_progress(current, total):
+                    await ul_viewer.update(current, total)
+                    
+                await client.send_document(
+                    chat_id, 
+                    document=final_output_name, 
+                    thumb=thumb_path if os.path.exists(thumb_path) else None,
+                    reply_to_message_id=session['message_to_reply'],
+                    progress=ul_progress
+                )
         
         # Clean up the chat by deleting the prompt/progress message!
         try:
@@ -790,11 +825,14 @@ async def start_callback(client, callback_query):
             await status_message.edit_text(f"❌ Pipeline crashed: {e}")
     finally:
         active_jobs.pop(chat_id, None)
-        if not download_complete and os.path.exists(local_input):
+        if not download_complete and local_input and os.path.exists(local_input):
             os.remove(local_input) # Only delete if it crashed mid-download
-        if 'final_output_name' in locals() and os.path.exists(final_output_name):
-            os.remove(final_output_name)
-        if 'thumb_path' in locals() and os.path.exists(thumb_path):
+        
+        for f in encoded_files_to_cleanup:
+            if os.path.exists(f):
+                os.remove(f)
+
+        if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
 
 @app.on_callback_query(filters.regex(r"^cancel_job$"))
