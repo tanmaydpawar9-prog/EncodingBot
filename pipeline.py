@@ -14,7 +14,7 @@ from pyrogram.errors import FloodWait
 
 # --- Lightning AI GPU Fix ---
 # Ensures FFmpeg can find libcuda.so.1 for the RTX 6000 NVENC encoder
-cuda_paths = "/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+cuda_paths = "/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/usr/lib64:/lib64"
 os.environ['LD_LIBRARY_PATH'] = f"{cuda_paths}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
 # --- Basic Bot Logging ---
@@ -393,15 +393,19 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
     ]
     
     try:
+        env = os.environ.copy()
         # Use asyncio subprocess so we can gracefully terminate FFmpeg if cancelled
         process = await asyncio.create_subprocess_exec(
             *cmd_nvenc,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env
         )
         
         if chat_id and chat_id in active_jobs:
-            active_jobs[chat_id]['process'] = process
+            if 'processes' not in active_jobs[chat_id]:
+                active_jobs[chat_id]['processes'] = []
+            active_jobs[chat_id]['processes'].append(process)
             
         viewer = EncodingProgressViewer(status_message, chat_id) if status_message else None
         
@@ -494,8 +498,8 @@ os.makedirs("downloads", exist_ok=True)
 # --- Pipeline Concurrency Controls ---
 # Semaphores to allow processing different files at different stages concurrently
 dl_semaphore = asyncio.Semaphore(2)  # Max concurrent downloads
-mux_semaphore = asyncio.Semaphore(1) # Max concurrent GPU encodes (prevents crashing)
-ul_semaphore = asyncio.Semaphore(2)  # Max concurrent uploads
+mux_semaphore = asyncio.Semaphore(3) # Max concurrent GPU encodes (allows 3 parallel)
+ul_semaphore = asyncio.Semaphore(3)  # Max concurrent uploads
 
 def is_allowed(user_id):
     if not user_id:
@@ -653,10 +657,15 @@ async def meta_handler(client, message):
             return
 
         session['awaiting_thumbnail'] = False
-        if session['source_type'] == 'url':
+        if session['source_type'] in ['url', 'local']:
+            source_map = {
+                'url': 'URL Link',
+                'local': f"Cached Video (`{session.get('vid_id')}`)"
+            }
+            source_text = source_map.get(session['source_type'], 'Unknown')
             summary = (
                 f"Okay, here is the plan:\n\n"
-                f"🔹 **Source:** `URL Link`\n"
+                f"🔹 **Source:** `{source_text}`\n"
                 f"🔹 **Base Filename:** `{session['original_name']}`\n"
                 f"🔹 **Output Qualities:** `1080P, 720P, 480P`\n\n"
                 f"This will generate three separate video files. Do you want to begin the process?"
@@ -688,9 +697,18 @@ async def quality_callback(client, callback_query):
     final_output_name = process_metadata(user_sessions[chat_id]['original_name'], quality)
     user_sessions[chat_id]['final_output_name'] = final_output_name
 
+    source_type = user_sessions[chat_id]['source_type']
+    if source_type == 'url':
+        source_text = 'URL Link'
+    elif source_type == 'local':
+        source_text = f"Cached Video (`{user_sessions[chat_id].get('vid_id')}`)"
+    else:
+        source_text = 'Telegram Message'
+
     summary = (
         f"Okay, here is the plan:\n\n"
         f"🔹 **Source:** `{'URL Link' if user_sessions[chat_id]['source_type'] == 'url' else 'Telegram Message'}`\n"
+        f"🔹 **Source:** `{source_text}`\n"
         f"🔹 **Output Quality:** `{quality}`\n"
         f"🔹 **Final Filename:** `{final_output_name}`\n\n"
         f"Do you want to begin the process?"
@@ -721,7 +739,7 @@ async def start_callback(client, callback_query):
     status_message = await callback_query.edit_message_text("⏳ Queuing job...")
     
     # Register active job
-    active_jobs[chat_id] = {'cancel': False, 'process': None}
+    active_jobs[chat_id] = {'cancel': False, 'processes': []}
     download_complete = False
     
     local_input = None
@@ -774,38 +792,58 @@ async def start_callback(client, callback_query):
                 ("480P", process_metadata(session['original_name'], "480P")),
             ]
 
+        async def process_quality(quality, final_output_name):
+            q_status = await client.send_message(chat_id, f"⏳ Queuing {quality} version...")
+            try:
+                # --- 2. Encode ---
+                await q_status.edit_text(f"⏳ Waiting for GPU to encode {quality} version...")
+                async with mux_semaphore:
+                    if active_jobs.get(chat_id, {}).get('cancel'):
+                        raise Exception("User Cancelled")
+                    await q_status.edit_text(f"🎬 Encoding {quality} version...")
+                    await encode_video(local_input, final_output_name, quality, chat_id, q_status)
+                
+                # --- 3. Upload ---
+                await q_status.edit_text(f"⏳ Waiting to upload {quality} version...")
+                async with ul_semaphore:
+                    if active_jobs.get(chat_id, {}).get('cancel'):
+                        raise Exception("User Cancelled")
+                    await q_status.edit_text(f"🚀 Uploading {quality} version...")
+                    ul_viewer = PyrogramProgressViewer(q_status, f"Uploading {quality}", chat_id)
+                    
+                    async def ul_progress(current, total):
+                        await ul_viewer.update(current, total)
+                        
+                    await client.send_document(
+                        chat_id, 
+                        document=final_output_name, 
+                        thumb=thumb_path if os.path.exists(thumb_path) else None,
+                        reply_to_message_id=session['message_to_reply'],
+                        progress=ul_progress
+                    )
+                # Clean up the individual progress message once successfully uploaded
+                try:
+                    await q_status.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                if "User Cancelled" in str(e):
+                    await q_status.edit_text(f"❌ {quality} cancelled.")
+                else:
+                    await q_status.edit_text(f"❌ {quality} failed: {e}")
+                raise e
+
+        await status_message.edit_text("🚀 Starting parallel encoding tasks...")
+        tasks = []
         for quality, final_output_name in qualities_to_encode:
             encoded_files_to_cleanup.append(final_output_name)
-            if active_jobs.get(chat_id, {}).get('cancel'):
-                raise Exception("User Cancelled")
-
-            # --- 2. Encode ---
-            await status_message.edit_text(f"⏳ Waiting for GPU to encode {quality} version...")
-            async with mux_semaphore:
-                if active_jobs.get(chat_id, {}).get('cancel'):
-                    raise Exception("User Cancelled")
-                
-                await status_message.edit_text(f"🎬 Encoding {quality} version...")
-                await encode_video(local_input, final_output_name, quality, chat_id, status_message)
+            tasks.append(process_quality(quality, final_output_name))
             
-            # --- 3. Upload ---
-            await status_message.edit_text(f"⏳ Waiting to upload {quality} version...")
-            async with ul_semaphore:
-                if active_jobs.get(chat_id, {}).get('cancel'):
-                    raise Exception("User Cancelled")
-                
-                await status_message.edit_text(f"🚀 Uploading {quality} version...")
-                ul_viewer = PyrogramProgressViewer(status_message, f"Uploading {quality}", chat_id)
-                async def ul_progress(current, total):
-                    await ul_viewer.update(current, total)
-                    
-                await client.send_document(
-                    chat_id, 
-                    document=final_output_name, 
-                    thumb=thumb_path if os.path.exists(thumb_path) else None,
-                    reply_to_message_id=session['message_to_reply'],
-                    progress=ul_progress
-                )
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
         
         # Clean up the chat by deleting the prompt/progress message!
         try:
@@ -848,8 +886,8 @@ async def cancel_job_callback(client, callback_query):
         await callback_query.answer("Cancelling job... Please wait.", show_alert=True)
         
         # Kill FFmpeg if it's currently running
-        process = active_jobs[chat_id].get('process')
-        if process:
+        processes = active_jobs[chat_id].get('processes', [])
+        for process in processes:
             try:
                 process.terminate()
             except Exception:
