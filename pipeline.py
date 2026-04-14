@@ -9,7 +9,7 @@ import requests
 import concurrent.futures
 import uuid
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from pyrogram.errors import FloodWait
 
 # --- Lightning AI GPU Fix ---
@@ -538,7 +538,8 @@ async def start(client, message):
     await message.reply_text(
         "Welcome! I am a video encoding bot.\n"
         "Reply to any video message with `/encode`, OR send `/encode <url>` to start a new job.\n"
-        "To reuse a cached video, send `/log <video_id>`."
+        "To reuse a cached video, send `/log <video_id>`.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
 @app.on_message(filters.command("shutdown") & filters.private)
@@ -592,7 +593,8 @@ async def encode_command(client, message):
         }
     
     await message.reply_text(
-        f"✨ Found video: `{original_name}`\nPlease reply with the desired output filename (or type `/skip` to use the original name):"
+        f"✨ Found video: `{original_name}`\nPlease reply with the desired output filename (or type `/skip` to use the original name):",
+        reply_markup=ReplyKeyboardRemove()
     )
     
 @app.on_message(filters.command("log") & filters.private)
@@ -633,7 +635,7 @@ async def meta_handler(client, message):
         session['last_media_group_id'] = message.media_group_id
 
     # Ignore Userbot/PM-guard auto-replies that break the bot's conversation flow
-    if message.text and "Access denied" in message.text:
+    if message.text and any(phrase in message.text.lower() for phrase in ["access denied", "access blocked", "⛔"]):
         return
 
     now = time.time()
@@ -695,6 +697,9 @@ async def meta_handler(client, message):
             f"  `{name_1080}`\n"
             f"  `{name_720}`\n"
             f"  `{name_480}`\n\n"
+            f"  {name_1080}\n"
+            f"  {name_720}\n"
+            f"  {name_480}\n\n"
             f"This will generate three separate video files. Do you want to begin the process?"
         )
         keyboard = InlineKeyboardMarkup([
