@@ -12,9 +12,9 @@ A high-speed, crash-proof video downloading, encoding, and uploading pipeline co
    ```
 
 2. **Install System Dependencies (FFmpeg):**
+   Lightning AI Studios come with Conda. Use `conda-forge` to install an FFmpeg version that has NVIDIA NVENC (`h264_nvenc`) baked in:
    ```bash
-   sudo apt-get update
-   sudo apt-get install ffmpeg -y
+   conda install -y -c conda-forge ffmpeg
    ```
 
 3. **Install Python Requirements:**

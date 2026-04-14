@@ -12,6 +12,11 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
+# --- Lightning AI GPU Fix ---
+# Ensures FFmpeg can find libcuda.so.1 for the RTX 6000 NVENC encoder
+cuda_paths = "/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+os.environ['LD_LIBRARY_PATH'] = f"{cuda_paths}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+
 # --- Basic Bot Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -375,8 +380,8 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
     
     # RTX 6000 hardware-accelerated NVENC settings for speed and quality
     cmd_nvenc = [
-        'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
-        '-map', '0:v:0',           # Maps ONLY the main video stream (forces FFmpeg to ignore broken MJPEG thumbnails)
+        'ffmpeg', '-y', '-i', input_file,
+        '-map', '0:v:0',           # Maps ONLY the main video stream (avoids broken thumbnails)
         '-map', '0:a?',            # Maps all audio streams
         '-map', '0:s?',            # Maps all subtitle streams
         '-vf', f'scale={scale},format=yuv420p', # Ensure 8-bit YUV420p to fix NVENC invalid param 8
