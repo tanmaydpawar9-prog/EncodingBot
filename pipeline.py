@@ -514,9 +514,9 @@ os.makedirs("downloads", exist_ok=True)
 
 # --- Pipeline Concurrency Controls ---
 # Semaphores to allow processing different files at different stages concurrently
-dl_semaphore = asyncio.Semaphore(2)  # Max concurrent downloads
+dl_semaphore = asyncio.Semaphore(4)  # Max concurrent downloads (increased for faster processing)
 mux_semaphore = asyncio.Semaphore(3) # Max concurrent GPU encodes (allows 3 parallel)
-ul_semaphore = asyncio.Semaphore(3)  # Max concurrent uploads
+ul_semaphore = asyncio.Semaphore(6)  # Max concurrent uploads (increased for faster processing)
 
 def is_allowed(user_id):
     if not user_id:
