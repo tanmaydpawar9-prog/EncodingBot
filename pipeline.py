@@ -236,8 +236,8 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         try:
-            # Generous timeout for slow servers and Heroku's strict limits
-            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 60))
+            # Shorter timeout for chunk downloads to fail faster on stalls
+            res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 30))
             res.raise_for_status()
             
             if res.status_code == 200:
@@ -247,13 +247,13 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
                 f.seek(current_start)
                 buffer = bytearray()
                 try:
-                    # 8KB chunks prevent data loss when exception is raised mid-stream
-                    for chunk in res.iter_content(chunk_size=8192):
+                    # 128KB chunks for better throughput, buffered to 1MB before disk write
+                    for chunk in res.iter_content(chunk_size=128 * 1024):
                         if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
                             return
                         if chunk:
                             buffer.extend(chunk)
-                            # Buffer to 1MB to prevent disk stuttering
+                            # Buffer writes to 1MB to prevent disk stuttering
                             if len(buffer) >= 1024 * 1024:
                                 f.write(buffer)
                                 progress_list[idx] += len(buffer)
@@ -299,8 +299,8 @@ async def download_video_from_url(url, output_path, progress_viewer):
     
     for attempt in range(3):
         try:
-            # 60s timeout allows sleeping servers (like Heroku) to wake up
-            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 60))
+            # 30s timeout allows sleeping servers to wake up without a long delay
+            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 30))
             res.raise_for_status()
             break
         except requests.exceptions.RequestException as e:
