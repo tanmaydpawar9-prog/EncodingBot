@@ -685,9 +685,6 @@ async def meta_handler(client, message):
             f"  `{name_1080}`\n"
             f"  `{name_720}`\n"
             f"  `{name_480}`\n\n"
-            f"  {name_1080}\n"
-            f"  {name_720}\n"
-            f"  {name_480}\n\n"
             f"This will generate three separate video files. Do you want to begin the process?"
         )
         keyboard = InlineKeyboardMarkup([
