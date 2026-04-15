@@ -212,25 +212,12 @@ def get_video_duration(input_file):
 # ==========================================
 
 def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
-    retries = 100
-    last_progress = -1
-    stuck_count = 0
-    
+    retries = 15
+
     for attempt in range(retries):
         current_start = start + progress_list[idx]
         if current_start > end:
             return
-            
-        if progress_list[idx] == last_progress:
-            stuck_count += 1
-            if stuck_count > 10:
-                logger.warning(f"Thread {idx} stuck at byte {current_start}. Assuming EOF ghost data.")
-                progress_list[idx] = (end - start) + 1
-                return
-        else:
-            stuck_count = 0
-            last_progress = progress_list[idx]
-            
         headers = {
             "Range": f"bytes={current_start}-{end}", 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -270,7 +257,7 @@ def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
                 return # Success
         except Exception as e:
             logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
-            time.sleep(3)
+            time.sleep(2)
             
     raise Exception(f"Download thread {idx} permanently failed after {retries} retries.")
     
@@ -299,8 +286,8 @@ async def download_video_from_url(url, output_path, progress_viewer):
     
     for attempt in range(3):
         try:
-            # 30s timeout allows sleeping servers to wake up without a long delay
-            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(15, 30))
+            # Reduced timeout to fail faster on unresponsive servers
+            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 20))
             res.raise_for_status()
             break
         except requests.exceptions.RequestException as e:
@@ -635,7 +622,8 @@ async def meta_handler(client, message):
         session['last_media_group_id'] = message.media_group_id
 
     # Ignore Userbot/PM-guard auto-replies that break the bot's conversation flow
-    if message.text and any(phrase in message.text.lower() for phrase in ["access denied", "access blocked", "⛔"]):
+    text_content = message.text or message.caption
+    if text_content and any(phrase in text_content.lower() for phrase in ["access denied", "access blocked", "⛔"]):
         return
 
     now = time.time()
