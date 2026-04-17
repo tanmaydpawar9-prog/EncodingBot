@@ -138,7 +138,7 @@ class EncodingProgressViewer:
 # ==========================================
 def process_metadata(original_name, quality_choice):
     """Replaces [4K], [1080P], etc., with the user's chosen output quality."""
-    pattern = r'(?i)\[(4k|1080p|720p|480p|360p)\]'
+    pattern = r'(?i)\[(4k|2k|1080p|720p|360p)\]'
     new_name = re.sub(pattern, f'[{quality_choice.upper()}]', original_name)
     
     if new_name == original_name:
@@ -169,12 +169,12 @@ def get_target_bitrate(input_file, quality_choice):
 
     qual = quality_choice.upper()
     
-    if '1080' in qual:
+    if '2K' in qual:
+        br = int(original_bitrate * 0.75)
+    elif '1080' in qual:
         br = int(original_bitrate * 0.5)
     elif '720' in qual:
         br = int(original_bitrate * 0.25)
-    elif '480' in qual:
-        br = int(original_bitrate * 0.125)
     else:
         br = original_bitrate
     
@@ -363,12 +363,12 @@ async def encode_video(input_file, output_file, quality_choice, chat_id=None, st
         
     # Map quality to fixed width, letting height auto-scale (-2)
     qual = quality_choice.upper()
-    if '1080' in qual:
+    if '2K' in qual:
+        scale = '2560:-2'
+    elif '1080' in qual:
         scale = '1920:-2'
     elif '720' in qual:
         scale = '1280:-2'
-    elif '480' in qual:
-        scale = '854:-2'
     else:
         scale = '1920:-2'
 
@@ -517,7 +517,9 @@ def is_allowed(user_id):
     return True
 
 @app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
+async def start(client, message                 ;'
+
+   '):
     if not is_allowed(message.from_user.id):
         await message.reply_text("❌ Access Denied: You are not authorized to use this bot.")
         return
@@ -673,18 +675,18 @@ async def meta_handler(client, message):
         source_text = source_map.get(session['source_type'], 'Unknown')
         
         # Pre-calculate to show the user exactly what the final names will be
+        name_2k = process_metadata(session['original_name'], "2K")
         name_1080 = process_metadata(session['original_name'], "1080P")
         name_720 = process_metadata(session['original_name'], "720P")
-        name_480 = process_metadata(session['original_name'], "480P")
 
         summary = (
             f"Okay, here is the plan:\n\n"
             f"🔹 **Source:** `{source_text}`\n"
             f"🔹 **Base Filename:** `{session['original_name']}`\n\n"
             f"🔹 **Output Files:**\n"
+            f"  `{name_2k}`\n"
             f"  `{name_1080}`\n"
             f"  `{name_720}`\n"
-            f"  `{name_480}`\n\n"
             f"This will generate three separate video files. Do you want to begin the process?"
         )
         keyboard = InlineKeyboardMarkup([
@@ -758,9 +760,9 @@ async def start_callback(client, callback_query):
 
         # Determine qualities to encode
         qualities_to_encode = [
+            ("2K", process_metadata(session['original_name'], "2K")),
             ("1080P", process_metadata(session['original_name'], "1080P")),
             ("720P", process_metadata(session['original_name'], "720P")),
-            ("480P", process_metadata(session['original_name'], "480P")),
         ]
 
         async def process_quality(quality, final_output_name):
