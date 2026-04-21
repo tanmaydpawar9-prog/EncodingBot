@@ -164,8 +164,8 @@ def get_target_bitrate(input_file, quality_choice):
             out = res.stdout.strip()
             if out and out.lower() != 'n/a':
                 original_bitrate = int(out)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not get original bitrate via ffprobe: {e}. Falling back to default.")
 
     qual = quality_choice.upper()
     
@@ -192,8 +192,8 @@ def get_video_duration(input_file):
             out = res.stdout.strip()
             if out and out.lower() != 'n/a':
                 return float(out)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not get video duration from format: {e}. Trying stream duration.")
         
     # Fallback to video stream duration (specifically for MKV files)
     cmd_stream = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
@@ -203,8 +203,8 @@ def get_video_duration(input_file):
             out = res.stdout.strip()
             if out and out.lower() != 'n/a':
                 return float(out.split('\n')[0])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not get video duration from stream: {e}. Fallback to 0.")
     return 0.0
 
 # ==========================================
@@ -470,7 +470,7 @@ def deactivate_machine():
     time.sleep(2)
     try:
         # This command powers down the Linux VM running the studio
-        os.system("sudo shutdown -h now")
+        subprocess.run(["sudo", "shutdown", "-h", "now"], check=True)
     except Exception as e:
         print(f"Could not automatically shut down. Please stop manually. Error: {e}")
 
@@ -517,9 +517,7 @@ def is_allowed(user_id):
     return True
 
 @app.on_message(filters.command("start") & filters.private)
-async def start(client, message                 ;'
-
-   '):
+async def start(client, message):
     if not is_allowed(message.from_user.id):
         await message.reply_text("❌ Access Denied: You are not authorized to use this bot.")
         return
@@ -814,9 +812,11 @@ async def start_callback(client, callback_query):
             
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, Exception):
-                    raise res
+            failed_tasks = [res for res in results if isinstance(res, Exception)]
+            if failed_tasks:
+                # Combine error messages from all failed tasks for a clear report
+                error_summary = "\n".join([f"- {type(e).__name__}: {e}" for e in failed_tasks])
+                raise Exception(f"One or more encoding tasks failed:\n{error_summary}")
         
         # Clean up the chat by deleting the prompt/progress message!
         try:
