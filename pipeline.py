@@ -9,6 +9,7 @@ import requests
 import http.server
 import socketserver
 import threading
+import shutil
 import concurrent.futures
 import uuid
 from pyrogram import Client, filters
@@ -32,20 +33,45 @@ logger = logging.getLogger(__name__)
 HTTP_PORT = 8000
 http_server_thread = None
 server_lock = threading.Lock()
+file_id_map = {} # Maps a unique ID to a file path
+
+class CustomHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+    """A custom handler that serves files based on a UUID map."""
+    def do_GET(self):
+        if self.path.startswith('/download/'):
+            file_id = self.path.split('/')[-1]
+            file_path = file_id_map.get(file_id)
+            
+            if file_path and os.path.exists(file_path):
+                try:
+                    with open(file_path, 'rb') as f:
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/octet-stream')
+                        self.send_header('Content-Disposition', f'attachment; filename="{os.path.basename(file_path)}"')
+                        fs = os.fstat(f.fileno())
+                        self.send_header("Content-Length", str(fs.st_size))
+                        self.end_headers()
+                        shutil.copyfileobj(f, self.wfile)
+                except Exception as e:
+                    logger.error(f"HTTP server error serving file: {e}")
+                    self.send_error(500, "Server error while serving file")
+            else:
+                self.send_error(404, "File not found or link expired")
+        else:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"Encoding Bot File Server is running.")
 
 def start_http_server():
     """Starts a simple HTTP server in a background thread if not already running."""
     global http_server_thread
     with server_lock:
         if http_server_thread is None or not http_server_thread.is_alive():
-            class Handler(http.server.SimpleHTTPRequestHandler):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, directory="downloads", **kwargs)
-
-            httpd = socketserver.TCPServer(("", HTTP_PORT), Handler)
+            httpd = socketserver.TCPServer(("", HTTP_PORT), CustomHTTPRequestHandler)
             
             def serve():
-                logger.info(f"Starting HTTP server on port {HTTP_PORT} to serve files from 'downloads' directory.")
+                logger.info(f"Starting HTTP server on port {HTTP_PORT} to serve files.")
                 httpd.serve_forever()
                 
             http_server_thread = threading.Thread(target=serve, daemon=True)
@@ -814,7 +840,10 @@ async def start_callback(client, callback_query):
                     start_http_server()
                     files_to_keep.append(final_output_name)
                     
-                    file_name = os.path.basename(final_output_name)
+                    # Generate a unique ID for this file and map it
+                    file_id = uuid.uuid4().hex
+                    file_id_map[file_id] = final_output_name
+                    download_path = f"/download/{file_id}"
                     
                     public_url = os.getenv("LIGHTNING_APP_STATE_URL") or os.getenv("LIGHTNING_HOST")
 
@@ -823,16 +852,27 @@ async def start_callback(client, callback_query):
                             public_url = "https://" + public_url
                         public_url = public_url.rstrip('/')
                         
-                        download_link = f"{public_url}/{file_name}"
+                        # Best guess for the URL, replacing the default app port with our HTTP port
+                        download_link = f"{public_url.replace('7860', str(HTTP_PORT))}{download_path}"
                         await client.send_message(
                             chat_id,
-                            f"🔗 **{quality} version is ready!**\n\nFile is too large for Telegram. Use this direct download link:\n{download_link}",
+                            (
+                                f"🔗 **{quality} version is ready!**\n\n"
+                                f"File is too large for Telegram. Use this direct download link:\n`{download_link}`\n\n"
+                                f"**Note:** You must expose port `{HTTP_PORT}` in the Lightning AI UI for this link to work. The port in the URL may need to be adjusted manually if it's incorrect."
+                            ),
                             reply_to_message_id=session['message_to_reply']
                         )
                     else:
+                        # This is the case you likely hit, where no public URL env var is set.
+                        file_name_for_display = os.path.basename(final_output_name)
                         await client.send_message(
                             chat_id,
-                            f"✅ **{quality} version is ready!**\n\nFile is too large for Telegram. It has been saved on the server as `{file_name}`.\n\nTo download, please use the Lightning AI UI to expose port `{HTTP_PORT}` and then access `http://<your-public-url>:{HTTP_PORT}/{file_name}`.",
+                            f"✅ **{quality} version is ready!**\n\n"
+                            f"File is too large for Telegram. It has been saved on the server as `{file_name_for_display}`.\n\n"
+                            f"To download, please use the Lightning AI UI to expose port `{HTTP_PORT}` and then access the following path on your public URL:\n"
+                            f"`{download_path}`\n\n"
+                            f"Example: `http://<your-public-url-for-port-{HTTP_PORT}>{download_path}`",
                             reply_to_message_id=session['message_to_reply']
                         )
                 else:
