@@ -6,6 +6,9 @@ import subprocess
 import logging
 import asyncio
 import requests
+import http.server
+import socketserver
+import threading
 import concurrent.futures
 import uuid
 from pyrogram import Client, filters
@@ -22,6 +25,32 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ==========================================
+# 0. HTTP Server for Large File Downloads
+# ==========================================
+HTTP_PORT = 8000
+http_server_thread = None
+server_lock = threading.Lock()
+
+def start_http_server():
+    """Starts a simple HTTP server in a background thread if not already running."""
+    global http_server_thread
+    with server_lock:
+        if http_server_thread is None or not http_server_thread.is_alive():
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory="downloads", **kwargs)
+
+            httpd = socketserver.TCPServer(("", HTTP_PORT), Handler)
+            
+            def serve():
+                logger.info(f"Starting HTTP server on port {HTTP_PORT} to serve files from 'downloads' directory.")
+                httpd.serve_forever()
+                
+            http_server_thread = threading.Thread(target=serve, daemon=True)
+            http_server_thread.start()
+            logger.info("HTTP server thread started.")
 
 # ==========================================
 # 1. Custom Progress Bar Formatting
@@ -149,7 +178,8 @@ def process_metadata(original_name, quality_choice):
     base, _ = os.path.splitext(new_name)
     new_name = f"{base}.mkv"
         
-    return new_name
+    # Ensure the output is in the downloads directory for serving
+    return os.path.join("downloads", os.path.basename(new_name))
 
 def get_target_bitrate(input_file, quality_choice):
     """Dynamically calculates bitrate scaling."""
@@ -719,6 +749,7 @@ async def start_callback(client, callback_query):
     local_input = None
     thumb_path = None
     encoded_files_to_cleanup = []
+    files_to_keep = [] # For files > 2GB that will be served via HTTP
     
     try:
         vid_id = session.get('vid_id', uuid.uuid4().hex[:8])
@@ -774,25 +805,56 @@ async def start_callback(client, callback_query):
                     await q_status.edit_text(f"🎬 Encoding {quality} version...")
                     await encode_video(local_input, final_output_name, quality, chat_id, q_status)
                 
-                # --- 3. Upload ---
-                await q_status.edit_text(f"⏳ Waiting to upload {quality} version...")
-                async with ul_semaphore:
-                    if active_jobs.get(chat_id, {}).get('cancel'):
-                        raise Exception("User Cancelled")
-                    await q_status.edit_text(f"🚀 Uploading {quality} version...")
-                    ul_viewer = PyrogramProgressViewer(q_status, f"Uploading {quality}", chat_id)
+                # --- 3. Upload or Link ---
+                file_size = os.path.getsize(final_output_name)
+                TELEGRAM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+                if file_size >= TELEGRAM_LIMIT_BYTES:
+                    await q_status.edit_text(f"✅ {quality} encoded. File is {file_size / (1024**3):.2f} GB, too large for Telegram. Generating download link...")
+                    start_http_server()
+                    files_to_keep.append(final_output_name)
                     
-                    async def ul_progress(current, total):
-                        await ul_viewer.update(current, total)
+                    file_name = os.path.basename(final_output_name)
+                    
+                    public_url = os.getenv("LIGHTNING_APP_STATE_URL") or os.getenv("LIGHTNING_HOST")
+
+                    if public_url:
+                        if not public_url.startswith("http"):
+                            public_url = "https://" + public_url
+                        public_url = public_url.rstrip('/')
                         
-                    await client.send_document(
-                        chat_id, 
-                        document=final_output_name, 
-                        thumb=thumb_path if os.path.exists(thumb_path) else None,
-                        reply_to_message_id=session['message_to_reply'],
-                        progress=ul_progress
-                    )
-                # Clean up the individual progress message once successfully uploaded
+                        download_link = f"{public_url}/{file_name}"
+                        await client.send_message(
+                            chat_id,
+                            f"🔗 **{quality} version is ready!**\n\nFile is too large for Telegram. Use this direct download link:\n{download_link}",
+                            reply_to_message_id=session['message_to_reply']
+                        )
+                    else:
+                        await client.send_message(
+                            chat_id,
+                            f"✅ **{quality} version is ready!**\n\nFile is too large for Telegram. It has been saved on the server as `{file_name}`.\n\nTo download, please use the Lightning AI UI to expose port `{HTTP_PORT}` and then access `http://<your-public-url>:{HTTP_PORT}/{file_name}`.",
+                            reply_to_message_id=session['message_to_reply']
+                        )
+                else:
+                    await q_status.edit_text(f"⏳ Waiting to upload {quality} version...")
+                    async with ul_semaphore:
+                        if active_jobs.get(chat_id, {}).get('cancel'):
+                            raise Exception("User Cancelled")
+                        await q_status.edit_text(f"🚀 Uploading {quality} version...")
+                        ul_viewer = PyrogramProgressViewer(q_status, f"Uploading {quality}", chat_id)
+                        
+                        async def ul_progress(current, total):
+                            await ul_viewer.update(current, total)
+                            
+                        await client.send_document(
+                            chat_id, 
+                            document=final_output_name, 
+                            thumb=thumb_path if os.path.exists(thumb_path) else None,
+                            reply_to_message_id=session['message_to_reply'],
+                            progress=ul_progress
+                        )
+
+                # Clean up the individual progress message once done
                 try:
                     await q_status.delete()
                 except Exception:
@@ -845,7 +907,7 @@ async def start_callback(client, callback_query):
             os.remove(local_input) # Only delete if it crashed mid-download
         
         for f in encoded_files_to_cleanup:
-            if os.path.exists(f):
+            if f not in files_to_keep and os.path.exists(f):
                 os.remove(f)
 
         if thumb_path and os.path.exists(thumb_path):
