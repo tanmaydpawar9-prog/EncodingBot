@@ -490,24 +490,101 @@ def suppress_static_overlay_cues(subs: list, fw: int, fh: int, dur: float) -> li
 # ══════════════════════════════════════════════════════════════════════════════
 #  Frame-stream processor  — FULL FRAME, no band crop
 # ══════════════════════════════════════════════════════════════════════════════
-def _process_frame_stream(engine, cmd: list, bpf: int,
-                           frame_h: int, frame_w: int,
-                           extract_fps: float, time_offset: float,
-                           cancel_check, progress_cb=None) -> list:
-    """
-    Producer-consumer OCR pipeline.
-    Reads raw BGR frames from FFmpeg stdout, runs PaddleOCR on each,
-    and returns a list of cue dicts with text, timestamps, and screen coordinates.
-    """
-    cues: list = []
-    fq: queue.Queue = queue.Queue(maxsize=256)  # larger queue — RTX 6000 is fast
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
+    cues = []
+    frame_q = queue.Queue(maxsize=128)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, bufsize=10**8)
-    time.sleep(0.3)
-    if proc.poll() is not None and proc.returncode != 0:
-        err = proc.stderr.read(500).decode(errors="replace")
-        raise RuntimeError(f"FFmpeg pipe failed: {err}")
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+    
+    time.sleep(0.5) 
+    if process.poll() is not None and process.returncode != 0:
+        err = process.stderr.read().decode('utf-8')
+        raise RuntimeError(f"FFmpeg crashed on startup. Error details: {err[:200]}")
+
+    def _reader():
+        idx = 0
+        while True:
+            if cancel_check():
+                process.terminate()
+                break
+            raw = process.stdout.read(bytes_per_frame)
+            if not raw or len(raw) != bytes_per_frame:
+                break
+            frame_q.put((idx, raw))
+            idx += 1
+        frame_q.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    frame_duration = 1.0 / extract_fps
+
+    while True:
+        item = frame_q.get()
+        if item is None:
+            break
+
+        frame_idx, raw_frame = item
+        cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
+
+        if progress_cb: 
+            progress_cb(frame_idx, cues)
+
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, max_val, _, _ = cv2.minMaxLoc(gray)
+
+        # Skip dark frames to save OCR processing time
+        if max_val >= 50:
+            try: result = engine.ocr(frame, cls=False)
+            except Exception: result = None
+
+            if result and result[0]:
+                img_w = frame.shape[1]
+                if is_target_res:
+                    centre_lines = [ln for ln in result[0] if ln[1][1] >= 0.25]
+                else:
+                    left_lim  = img_w * 0.10   
+                    right_lim = img_w * 0.80   
+                    centre_lines = [
+                        ln for ln in result[0]
+                        if ln[1][1] >= 0.25  
+                        and left_lim <= sum(p[0] for p in ln[0]) / 4 <= right_lim
+                    ]
+                    
+                for ln in centre_lines:
+                    raw_text = ln[1][0].strip()
+                    cmp_text = _norm_ocr_key(raw_text)
+
+                    if len(cmp_text) >= 1:
+                        # OFFSET MATH: Adds the crop back so ASS subtitles align perfectly
+                        xs = [p[0] + crop_x for p in ln[0]]
+                        ys = [p[1] + crop_y for p in ln[0]]
+                        
+                        x_center = sum(xs) / len(xs)
+                        y_center = sum(ys) / len(ys)
+                        box_w = max(xs) - min(xs)
+                        box_h = max(ys) - min(ys)
+                        
+                        cues.append({
+                            "start": cur_t,
+                            "end":   round(cur_t + frame_duration, 3),
+                            "text":  raw_text,
+                            "cmp":   cmp_text,
+                            "cx":    float(x_center),
+                            "cy":    float(y_center),
+                            "max_y": float(max(ys)),
+                            "x":     float(x_center),
+                            "y":     float(y_center),
+                            "bw":    float(box_w),
+                            "bh":    float(box_h),
+                        })
+
+    reader_thread.join()
+    process.stdout.close()
+    process.wait()
+    return cues
 
     def _reader():
         idx = 0
@@ -573,43 +650,171 @@ def get_real_duration(path: str) -> float:
         return float(out.decode().strip())
     except: return 0.0
 
-def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
-                     start_sec: float = 0.0, end_sec: float = None,
-                     cancel_check=None) -> tuple:
-    """
-    Returns (subs, frame_w, frame_h).
-    Scans EVERY FRAME of the full picture — RTX 6000 handles it easily.
-    """
+def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
     if cancel_check is None: cancel_check = lambda: False
 
-    cap    = cv2.VideoCapture(video_path)
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
+    _cap = cv2.VideoCapture(video_path)
+    native_fps = _cap.get(cv2.CAP_PROP_FPS) or 24.0
+    cv2_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    _cap.release()
 
-    duration  = get_real_duration(video_path) or 0.0
-    start_sec = max(start_sec or 0.0, 0.0)
-    end_sec   = min(end_sec if end_sec is not None else duration, duration)
-    proc_dur  = end_sec - start_sec
+    duration = get_real_duration(video_path)
+    if duration <= 0:
+        duration = cv2_frames / native_fps if native_fps > 0 else 0
+        
+    if start_sec is None or start_sec < 0: start_sec = 0.0
+    if end_sec is None or end_sec > duration: end_sec = duration
 
-    # Scale: keep native resolution up to 1920 wide for OCR
-    # RTX 6000 has 96 GB VRAM — no need to downscale aggressively
+    process_duration = end_sec - start_sec
+    extract_fps = native_fps
+    src_total_frames = int(process_duration * extract_fps)
+
     scale = min(1920, orig_w) / max(orig_w, 1)
-    s_w   = (int(orig_w * scale) >> 1) << 1   # even
-    s_h   = (int(orig_h * scale) >> 1) << 1
+    s_w = int(orig_w * scale)
+    s_h = int(orig_h * scale)
 
-    # FULL FRAME — no crop
-    bpf   = s_w * s_h * 3
-    vf    = f"scale={s_w}:{s_h}"
+    is_target_res = ((orig_w == 3840 and orig_h == 2160) or (orig_w == 1920 and orig_h == 1080))
+    
+    if is_target_res:
+        crop_x = int(s_w * 0.10)
+        crop_w = int(s_w * 0.80)
+    else:
+        crop_x = 0
+        crop_w = s_w
 
-    total_frames = int(proc_dur * fps)
-    t0 = time.time()
+    s_w -= s_w % 2
+    s_h -= s_h % 2
+    crop_x -= crop_x % 2
+    crop_w -= crop_w % 2
 
-    push(status_msg,
-         f"⚡ **Full-frame OCR** — {s_w}×{s_h} @ {fps:.2f}fps\n"
-         f"RTX 6000 scanning {total_frames:,} frames…",
-         CANCEL_BTN)
+    # Bottom 22% crop
+    crop_y = int(s_h * 0.78)
+    crop_y -= crop_y % 2
+    crop_h = int(s_h * 0.22)
+    crop_h -= crop_h % 2
+    
+    bytes_per_frame = crop_w * crop_h * 3
+    vf_str = f"scale={s_w}:{s_h},crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+
+    try:
+        import paddle
+        num_gpus = paddle.device.cuda.device_count() if paddle.device.is_compiled_with_cuda() else 0
+    except Exception: num_gpus = 0
+
+    scan_t0 = time.time()
+    
+    if num_gpus >= 2:
+        mid_time = process_duration / 2.0
+        overlap = 2.0 
+        
+        start0 = start_sec
+        dur0 = mid_time + overlap
+        
+        start1 = max(start_sec, start_sec + mid_time - overlap)
+        dur1 = process_duration - mid_time + overlap
+        
+        cmd0 = [
+            "ffmpeg", "-v", "error", "-y", 
+            "-hwaccel", "cuda",       
+            "-threads", "2",
+            "-ss", str(start0),
+            "-i", video_path, 
+            "-t", str(dur0), 
+            "-vf", vf_str, 
+            "-r", str(extract_fps), 
+            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        ]
+        
+        cmd1 = [
+            "ffmpeg", "-v", "error", "-y", 
+            "-hwaccel", "cuda",       
+            "-threads", "2",
+            "-ss", str(start1), 
+            "-i", video_path, 
+            "-t", str(dur1),
+            "-vf", vf_str, 
+            "-r", str(extract_fps), 
+            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        ]
+        
+        expected_f0 = int((mid_time + overlap) * extract_fps)
+        expected_f1 = int((process_duration - mid_time + overlap) * extract_fps)
+
+        engine0, engine1 = _load_ocr(0), _load_ocr(1)
+        _push(status_msg, "⚡ **Dual GPU Direct Stream (NVDEC)** — initializing...", CANCEL_BTN)
+
+        seg = [[], []]
+        _prog, _cues = [0, 0], [0, 0]
+        _lock = threading.Lock()
+
+        def _make_cb(gpu_idx):
+            def _cb(f_idx, cues_list):
+                with _lock:
+                    _prog[gpu_idx] = f_idx
+                    _cues[gpu_idx] = len(cues_list)
+            return _cb
+
+        def _worker(i, eng, cmd, t_offset):
+            # ADDED CROP_X AND CROP_Y HERE
+            seg[i] = _process_frame_stream(eng, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, t_offset, cancel_check, is_target_res, _make_cb(i))
+
+        threads = [
+            threading.Thread(target=_worker, args=(0, engine0, cmd0, start0), daemon=True),
+            threading.Thread(target=_worker, args=(1, engine1, cmd1, start1), daemon=True),
+        ]
+
+        for th in threads: th.start()
+
+        last_ui = time.time()
+        while any(th.is_alive() for th in threads):
+            if cancel_check(): break
+            now = time.time()
+            if now - last_ui > STATUS_REFRESH_SECS:
+                last_ui = now
+                with _lock:
+                    p0, p1 = _prog[0], _prog[1]
+                    c0, c1 = _cues[0], _cues[1]
+                combined = p0 + p1
+                _push(status_msg, f"{build_pb('⚡ Dual GPU Stream', combined, expected_f0 + expected_f1, scan_t0, False)}\n💬 Cues: {c0 + c1} | G0: {p0}/{expected_f0} G1: {p1}/{expected_f1}", CANCEL_BTN)
+            time.sleep(0.5)
+        for th in threads: th.join()
+
+        absolute_mid = start_sec + mid_time
+        seg0_clean = [s for s in seg[0] if s["start"] < absolute_mid]
+        seg1_clean = [s for s in seg[1] if s["start"] >= absolute_mid]
+
+        merged = sorted(seg0_clean + seg1_clean, key=lambda x: x["start"])
+        return stitch_continuous_lines(merged)
+
+    else:
+        engine = _load_ocr(0)
+        start0 = start_sec
+        dur0 = process_duration
+        
+        cmd = [
+            "ffmpeg", "-v", "error", "-y", 
+            "-hwaccel", "cuda",       
+            "-threads", "4",
+            "-ss", str(start0),
+            "-i", video_path, 
+            "-t", str(dur0),
+            "-vf", vf_str, 
+            "-r", str(extract_fps), 
+            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        ]
+        
+        last_ui = [time.time()]
+        def _progress(f_idx, cues_list):
+            now = time.time()
+            if now - last_ui[0] > STATUS_REFRESH_SECS:
+                last_ui[0] = now
+                _push(status_msg, f"{build_pb('Direct Stream OCR', f_idx, src_total_frames, scan_t0, False)}\n💬 Cues: {len(cues_list)}", CANCEL_BTN)
+
+        # ADDED CROP_X AND CROP_Y HERE
+        raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, start0, cancel_check, is_target_res, progress_cb=_progress)
+        return stitch_continuous_lines(raw_subs)
 
     def make_cmd(ss: float, dur: float, thr: str = "8") -> list:
         return [
