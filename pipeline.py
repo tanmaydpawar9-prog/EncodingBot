@@ -490,10 +490,9 @@ def suppress_static_overlay_cues(subs: list, fw: int, fh: int, dur: float) -> li
 # ══════════════════════════════════════════════════════════════════════════════
 #  Frame-stream processor  — FULL FRAME, no band crop
 # ══════════════════════════════════════════════════════════════════════════════
-def _process_frame_stream(engine, cmd, bytes_per_frame, frame_h, frame_w, extract_fps, time_offset, cancel_check, progress_cb=None):
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
     cues = []
     frame_q = queue.Queue(maxsize=128)
-    # Full frame means no cropping, so we don't need crop_x/y here anymore
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
     
     time.sleep(0.5) 
@@ -521,9 +520,7 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, frame_h, frame_w, extrac
         cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
         if progress_cb: progress_cb(frame_idx, cues)
 
-        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((frame_h, frame_w, 3))
-        
-        # Keep your brilliant skip-dark-frame optimization
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, max_val, _, _ = cv2.minMaxLoc(gray)
 
@@ -533,10 +530,11 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, frame_h, frame_w, extrac
 
             if result and result[0]:
                 for ln in result[0]:
-                    if ln[1][1] >= 0.25: # Confidence check
+                    if ln[1][1] >= 0.25:
                         raw_text = ln[1][0].strip()
-                        xs = [p[0] for p in ln[0]]
-                        ys = [p[1] for p in ln[0]]
+                        # Apply offsets here so the ASS generator gets absolute screen coordinates
+                        xs = [p[0] + crop_x for p in ln[0]]
+                        ys = [p[1] + crop_y for p in ln[0]]
                         
                         cues.append({
                             "start": cur_t,
@@ -553,7 +551,7 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, frame_h, frame_w, extrac
     process.stdout.close(); process.wait()
     return cues
 
-def run_ocr_pipeline(task: Task, video_path: str, status_msg, start_sec=0.0, end_sec=None, cancel_check=None):
+def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
     if cancel_check is None: cancel_check = lambda: False
 
     cap = cv2.VideoCapture(video_path)
@@ -563,21 +561,21 @@ def run_ocr_pipeline(task: Task, video_path: str, status_msg, start_sec=0.0, end
 
     duration = get_real_duration(video_path)
     if end_sec is None or end_sec > duration: end_sec = duration
-
     proc_dur = end_sec - start_sec
-    
-    # Target 1080p for OCR (sweet spot for PaddleOCR)
+
+    # Scale to 1080p
     scale = min(1920, orig_w) / max(orig_w, 1)
     s_w = (int(orig_w * scale) >> 1) << 1
     s_h = (int(orig_h * scale) >> 1) << 1
-    
-    task.ocr_res_w = s_w
-    task.ocr_res_h = s_h
+    task.ocr_res_w, task.ocr_res_h = s_w, s_h
 
     # FULL FRAME: No crop filter
     vf_str = f"scale={s_w}:{s_h}"
     bytes_per_frame = s_w * s_h * 3
+    crop_x, crop_y = 0, 0 # Offsets are 0 because we aren't cropping
+    crop_w, crop_h = s_w, s_h
 
+    # Command uses full frame
     cmd = [
         "ffmpeg", "-v", "error", "-y", 
         "-hwaccel", "cuda", "-threads", "8",
@@ -595,185 +593,8 @@ def run_ocr_pipeline(task: Task, video_path: str, status_msg, start_sec=0.0, end
             last_ui[0] = time.time()
             push(status_msg, pb_frames("Full-Frame OCR", fi, int(proc_dur*fps), t0, f"💬 Cues: {len(cues_list)}"), CANCEL_BTN)
 
-    raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, s_h, s_w, fps, start_sec, cancel_check, progress_cb=_progress)
+    raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, fps, start_sec, cancel_check, True, _progress)
     return stitch_continuous_lines(raw_subs)
-# ══════════════════════════════════════════════════════════════════════════════
-#  Full-frame OCR pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-def get_real_duration(path: str) -> float:
-    try:
-        out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path])
-        return float(out.decode().strip())
-    except: return 0.0
-
-def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
-    if cancel_check is None: cancel_check = lambda: False
-
-    _cap = cv2.VideoCapture(video_path)
-    native_fps = _cap.get(cv2.CAP_PROP_FPS) or 24.0
-    cv2_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    orig_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    _cap.release()
-
-    duration = get_real_duration(video_path)
-    if duration <= 0:
-        duration = cv2_frames / native_fps if native_fps > 0 else 0
-        
-    if start_sec is None or start_sec < 0: start_sec = 0.0
-    if end_sec is None or end_sec > duration: end_sec = duration
-
-    process_duration = end_sec - start_sec
-    extract_fps = native_fps
-    src_total_frames = int(process_duration * extract_fps)
-
-    scale = min(1920, orig_w) / max(orig_w, 1)
-    s_w = int(orig_w * scale)
-    s_h = int(orig_h * scale)
-
-    is_target_res = ((orig_w == 3840 and orig_h == 2160) or (orig_w == 1920 and orig_h == 1080))
-    
-    if is_target_res:
-        crop_x = int(s_w * 0.10)
-        crop_w = int(s_w * 0.80)
-    else:
-        crop_x = 0
-        crop_w = s_w
-
-    s_w -= s_w % 2
-    s_h -= s_h % 2
-    crop_x -= crop_x % 2
-    crop_w -= crop_w % 2
-
-    # Bottom 22% crop
-    crop_y = int(s_h * 0.78)
-    crop_y -= crop_y % 2
-    crop_h = int(s_h * 0.22)
-    crop_h -= crop_h % 2
-    
-    bytes_per_frame = crop_w * crop_h * 3
-    vf_str = f"scale={s_w}:{s_h},crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
-
-    try:
-        import paddle
-        num_gpus = paddle.device.cuda.device_count() if paddle.device.is_compiled_with_cuda() else 0
-    except Exception: num_gpus = 0
-
-    scan_t0 = time.time()
-    
-    if num_gpus >= 2:
-        mid_time = process_duration / 2.0
-        overlap = 2.0 
-        
-        start0 = start_sec
-        dur0 = mid_time + overlap
-        
-        start1 = max(start_sec, start_sec + mid_time - overlap)
-        dur1 = process_duration - mid_time + overlap
-        
-        cmd0 = [
-            "ffmpeg", "-v", "error", "-y", 
-            "-hwaccel", "cuda",       
-            "-threads", "2",
-            "-ss", str(start0),
-            "-i", video_path, 
-            "-t", str(dur0), 
-            "-vf", vf_str, 
-            "-r", str(extract_fps), 
-            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
-        ]
-        
-        cmd1 = [
-            "ffmpeg", "-v", "error", "-y", 
-            "-hwaccel", "cuda",       
-            "-threads", "2",
-            "-ss", str(start1), 
-            "-i", video_path, 
-            "-t", str(dur1),
-            "-vf", vf_str, 
-            "-r", str(extract_fps), 
-            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
-        ]
-        
-        expected_f0 = int((mid_time + overlap) * extract_fps)
-        expected_f1 = int((process_duration - mid_time + overlap) * extract_fps)
-
-        engine0, engine1 = _load_ocr(0), _load_ocr(1)
-        _push(status_msg, "⚡ **Dual GPU Direct Stream (NVDEC)** — initializing...", CANCEL_BTN)
-
-        seg = [[], []]
-        _prog, _cues = [0, 0], [0, 0]
-        _lock = threading.Lock()
-
-        def _make_cb(gpu_idx):
-            def _cb(f_idx, cues_list):
-                with _lock:
-                    _prog[gpu_idx] = f_idx
-                    _cues[gpu_idx] = len(cues_list)
-            return _cb
-
-        def _worker(i, eng, cmd, t_offset):
-            # ADDED CROP_X AND CROP_Y HERE
-            seg[i] = _process_frame_stream(eng, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, t_offset, cancel_check, is_target_res, _make_cb(i))
-
-        threads = [
-            threading.Thread(target=_worker, args=(0, engine0, cmd0, start0), daemon=True),
-            threading.Thread(target=_worker, args=(1, engine1, cmd1, start1), daemon=True),
-        ]
-
-        for th in threads: th.start()
-
-        last_ui = time.time()
-        while any(th.is_alive() for th in threads):
-            if cancel_check(): break
-            now = time.time()
-            if now - last_ui > REFRESH:
-                last_ui = now
-                with _lock:
-                    p0, p1 = _prog[0], _prog[1]
-                    c0, c1 = _cues[0], _cues[1]
-                combined = p0 + p1
-                _push(status_msg, f"{build_pb('⚡ Dual GPU Stream', combined, expected_f0 + expected_f1, scan_t0, False)}\n💬 Cues: {c0 + c1} | G0: {p0}/{expected_f0} G1: {p1}/{expected_f1}", CANCEL_BTN)
-            time.sleep(0.5)
-        for th in threads: th.join()
-
-        absolute_mid = start_sec + mid_time
-        seg0_clean = [s for s in seg[0] if s["start"] < absolute_mid]
-        seg1_clean = [s for s in seg[1] if s["start"] >= absolute_mid]
-
-        merged = sorted(seg0_clean + seg1_clean, key=lambda x: x["start"])
-        return stitch_continuous_lines(merged)
-
-    else:
-        engine = _load_ocr(0)
-        start0 = start_sec
-        dur0 = process_duration
-        
-        cmd = [
-            "ffmpeg", "-v", "error", "-y", 
-            "-hwaccel", "cuda",       
-            "-threads", "4",
-            "-ss", str(start0),
-            "-i", video_path, 
-            "-t", str(dur0),
-            "-vf", vf_str, 
-            "-r", str(extract_fps), 
-            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
-        ]
-        
-        last_ui = [time.time()]
-        def _progress(f_idx, cues_list):
-            now = time.time()
-            if now - last_ui[0] > REFRESH:  # <--- CHANGED HERE
-                last_ui[0] = now
-                # Also updating the push command to use the V3 UI helpers
-                push(status_msg, pb_frames("Targeted Zone OCR", f_idx, src_total_frames, scan_t0, f"💬 Raw Cues: {len(cues_list)}"), CANCEL_BTN)
-
-        # ADDED CROP_X AND CROP_Y HERE
-        raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, start0, cancel_check, is_target_res, progress_cb=_progress)
-        return stitch_continuous_lines(raw_subs)
 
     def make_cmd(ss: float, dur: float, thr: str = "8") -> list:
         return [
