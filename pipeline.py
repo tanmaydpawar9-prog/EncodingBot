@@ -967,8 +967,7 @@ async def quality_worker(task: Task, spec: QualitySpec, trigger_msg: Message, ta
 
     if err_str:
         log.error(f"[{label}] encode error: {err_str[:200]}")
-        try: await prog_msg.edit(f"❌ **[{label}]** Encode failed:\n```\n{err_str[:2000]}\n
-```", reply_markup=None)
+        try: await prog_msg.edit(f"❌ **[{label}]** Encode failed:\n```\n{err_str[:2000]}\n```", reply_markup=None)
         except: pass
         task.encode_done_flags[label].set(); return
 
