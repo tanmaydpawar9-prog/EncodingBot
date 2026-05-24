@@ -58,6 +58,13 @@ REFRESH        = 5
 UPLOAD_TAG     = "TheFrictionRealm"
 MIN_GAP_SEC    = 0.04
 _OCR_ENGINES   = {}
+IGNORE_OCR_PHRASES = (
+    "access denied",
+    "permission denied",
+    "403 forbidden",
+    "forbidden",
+    "sign in",
+)
 
 # RTX A6000 Concurrency Controls
 dl_semaphore  = asyncio.Semaphore(4)   
@@ -326,12 +333,24 @@ def _load_ocr(gpu_id: int = 0):
         from paddleocr import PaddleOCR
         try:
             import paddle
-            if paddle.device.is_compiled_with_cuda(): paddle.device.set_device(f"gpu:{gpu_id}")
-            _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=True, gpu_id=gpu_id, show_log=False)
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.set_device(f"gpu:{gpu_id}")
+            _OCR_ENGINES[gpu_id] = PaddleOCR(
+                use_angle_cls=True,
+                lang="ch",
+                use_gpu=True,
+                gpu_id=gpu_id,
+                show_log=False,
+            )
             log.info(f"PaddleOCR ready on GPU:{gpu_id}")
         except Exception as e:
             log.warning(f"GPU:{gpu_id} failed ({e}) → CPU fallback")
-            _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=False, show_log=False)
+            _OCR_ENGINES[gpu_id] = PaddleOCR(
+                use_angle_cls=True,
+                lang="ch",
+                use_gpu=False,
+                show_log=False,
+            )
     return _OCR_ENGINES[gpu_id]
 
 def _sub_key(cue: dict) -> str:
@@ -370,6 +389,11 @@ def stitch_continuous_lines(subs: list, max_gap: float = 0.15) -> list:
 def _norm_ocr_key(txt: str) -> str:
     return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
+
+def _is_noise_text(txt: str) -> bool:
+    t = (txt or "").strip().lower()
+    return (not t) or any(p in t for p in IGNORE_OCR_PHRASES)
+
 def suppress_static_overlay_cues(subs: list, frame_w: int, frame_h: int, total_dur: float) -> list:
     if not subs: return []
     kept = sorted(subs, key=lambda x: x["start"])
@@ -392,7 +416,7 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_
     frame_q = queue.Queue(maxsize=128)
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
     time.sleep(0.5)
-    
+
     if process.poll() is not None and process.returncode != 0:
         err = process.stderr.read(500).decode(errors="replace")
         raise RuntimeError(f"FFmpeg pipe crashed on startup: {err}")
@@ -400,11 +424,14 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_
     def _reader():
         idx = 0
         while True:
-            if cancel_check(): process.terminate(); break
-            # Safely read exact frame size to prevent silent EOF crashes
+            if cancel_check():
+                process.terminate()
+                break
             raw = _read_exact(process.stdout, bytes_per_frame)
-            if not raw: break
-            frame_q.put((idx, raw)); idx += 1
+            if not raw:
+                break
+            frame_q.put((idx, raw))
+            idx += 1
         frame_q.put(None)
 
     threading.Thread(target=_reader, daemon=True).start()
@@ -412,44 +439,54 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_
 
     while True:
         item = frame_q.get()
-        if item is None: break
+        if item is None:
+            break
         frame_idx, raw_frame = item
         cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
-        if progress_cb: progress_cb(frame_idx, cues)
+
+        if progress_cb:
+            progress_cb(frame_idx, cues)
 
         frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, max_val, _, _ = cv2.minMaxLoc(gray)
 
-        if max_val >= 50:
-            try:
-                result = engine.ocr(frame, cls=False)
-            except Exception as e:
-                log.error(f"OCR Inference Error at frame {frame_idx}: {e}")
-                result = None
+        # Less brittle than a hard brightness gate
+        if gray.mean() < 3 and gray.max() < 20:
+            continue
 
-            if result and result[0]:
-                for ln in result[0]:
-                    raw_text = ln[1][0].strip()
-                    cmp_text = _norm_ocr_key(raw_text)
-                    
-                    # Logic Fix: Removed the restrictive X-axis bounds that was skipping subtitle text. 
-                    # If PaddleOCR finds text with confidence > 25% anywhere in the 22% crop, it gets caught.
-                    if len(cmp_text) >= 1 and ln[1][1] >= 0.25:
-                        xs = [p[0] for p in ln[0]]; ys = [p[1] for p in ln[0]]
-                        cues.append({
-                            "start": cur_t, "end": round(cur_t + frame_dur, 3),
-                            "text": raw_text, "cmp": cmp_text,
-                            "x": sum(xs)/len(xs), "y": sum(ys)/len(ys),
-                            "bw": max(xs)-min(xs), "bh": max(ys)-min(ys),
-                        })
+        try:
+            result = engine.ocr(frame, cls=True)
+        except Exception as e:
+            log.error(f"OCR Inference Error at frame {frame_idx}: {e}")
+            result = None
 
-    process.stdout.close(); process.wait()
-    
-    # Catch mid-stream crashes if FFmpeg abruptly dies
+        if result and result[0]:
+            for ln in result[0]:
+                raw_text = (ln[1][0] or "").strip()
+                if _is_noise_text(raw_text):
+                    continue
+
+                cmp_text = _norm_ocr_key(raw_text)
+                if len(cmp_text) >= 1 and ln[1][1] >= 0.20:
+                    xs = [p[0] for p in ln[0]]
+                    ys = [p[1] for p in ln[0]]
+                    cues.append({
+                        "start": cur_t,
+                        "end": round(cur_t + frame_dur, 3),
+                        "text": raw_text,
+                        "cmp": cmp_text,
+                        "x": sum(xs) / len(xs),
+                        "y": sum(ys) / len(ys),
+                        "bw": max(xs) - min(xs),
+                        "bh": max(ys) - min(ys),
+                    })
+
+    process.stdout.close()
+    process.wait()
+
     if process.returncode != 0 and not cancel_check():
         log.error("FFmpeg exited abnormally. Subtitles from the remaining video may be missing.")
-        
+
     return cues
 
 def get_real_duration(path: str) -> float:
@@ -459,7 +496,9 @@ def get_real_duration(path: str) -> float:
     except: return 0.0
 
 def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
-    if cancel_check is None: cancel_check = lambda: False
+    if cancel_check is None:
+        cancel_check = lambda: False
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -467,8 +506,10 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
     cap.release()
 
     duration = get_real_duration(video_path) or (frames / fps if fps else 0)
-    if start_sec is None or start_sec < 0: start_sec = 0.0
-    if end_sec is None or end_sec > duration: end_sec = duration
+    if start_sec is None or start_sec < 0:
+        start_sec = 0.0
+    if end_sec is None or end_sec > duration:
+        end_sec = duration
 
     proc_dur = end_sec - start_sec
     extract_fps = fps
@@ -476,13 +517,14 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
 
     scale = min(1920, orig_w) / max(orig_w, 1)
     s_w, s_h = int(orig_w * scale), int(orig_h * scale)
-    s_w -= s_w % 2; s_h -= s_h % 2
+    s_w -= s_w % 2
+    s_h -= s_h % 2
     t0 = time.time()
 
     def make_cmd(ss, dur, vf, thr="4"):
         return [
             "ffmpeg", "-v", "error", "-y", "-threads", thr,
-            "-err_detect", "ignore_err", # Fix: Forces FFmpeg to push through corrupted intro sequence timestamps
+            "-err_detect", "ignore_err",
             "-ss", str(ss), "-i", video_path, "-t", str(dur),
             "-vf", vf, "-r", str(extract_fps),
             "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
@@ -496,6 +538,7 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
         crop_w = max(crop_w - (crop_w % 2), 2)
         crop_h = max(crop_h - (crop_h % 2), 2)
         crop_y = max(crop_y, 0)
+
         bpf = crop_w * crop_h * 3
         vf  = f"scale={s_w}:{s_h},crop={crop_w}:{crop_h}:0:{crop_y}"
 
@@ -507,13 +550,24 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
                 last_ui[0] = time.time()
                 push(status_msg, pb_frames("Direct Stream OCR", fi, total_frames, t0, f"💬 Cues: {len(cl)}"), CANCEL_BTN)
 
-        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, _progress)
-        raw = stitch_continuous_lines(raw)
-        return suppress_static_overlay_cues(raw, crop_w, crop_h, proc_dur)
+        return _process_frame_stream(
+            engine,
+            make_cmd(start_sec, proc_dur, vf),
+            bpf,
+            crop_h,
+            crop_w,
+            extract_fps,
+            start_sec,
+            cancel_check,
+            _progress,
+        )
 
-    # 22% strict limit enforced here
-    final_subs = _run_once(0.22)
-    return final_subs
+    raw = _run_once(0.22)
+    if not raw:
+        raw = _run_once(0.28)
+
+    raw = stitch_continuous_lines(raw)
+    return suppress_static_overlay_cues(raw, s_w, s_h, proc_dur)
 
 # ── CHATGPT TRANSLATION ───────────────────────────────────────────────────────
 async def batch_translate(zh_texts: list, status_msg=None, chat_id: int = None) -> list:
@@ -786,82 +840,116 @@ def out_filename(base: str, quality: str) -> str:
 def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec, output_name: str, src_bitrate: int) -> list:
     scale_factors = {"2K": 0.75, "1080p": 0.50, "720p": 0.25}
     target_bitrate = max(int(src_bitrate * scale_factors.get(spec.label, 0.50)), 500_000)
+    maxrate = int(target_bitrate * 1.2)
+    bufsize = int(target_bitrate * 2)
 
     return [
-        "ffmpeg", "-y", "-loglevel", "error", "-stats",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
         "-i", str(input_path),
         "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
         "-vf", f"scale_cuda={spec.width}:-2:interp_algo=lanczos:format=nv12",
         "-c:v", "hevc_nvenc", "-preset", "p4", "-tune", "hq",
+        "-rc", "vbr",
         "-b:v", str(target_bitrate),
-        "-c:a", "copy", "-c:s", "copy",
+        "-maxrate", str(maxrate),
+        "-bufsize", str(bufsize),
+        "-c:a", "copy",
+        "-c:s", "copy",
         "-metadata", f"title={output_name}",
-        str(out_path)
+        "-progress", "pipe:2",
+        "-nostats",
+        str(out_path),
     ]
 
 async def run_encode(task: Task, spec: QualitySpec, out_path: Path, prog_msg: Message):
     cancel = task.quality_cancel_flags[spec.label]
-    
-    # Allows 3 parallel hardware renders on the RTX A6000
+
     async with mux_semaphore:
-        if cancel.is_set() or task.cancel_flag.is_set(): return
+        if cancel.is_set() or task.cancel_flag.is_set():
+            return
 
         cmd = build_encode_cmd(task.input_path, out_path, spec, task.output_name, task.src_bitrate)
         log.info(f"[{spec.label}] RTX A6000 NVENC Encode start")
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         task.quality_procs[spec.label] = proc
 
-        last_edit, t0 = 0.0, time.time()
-        time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-        fps_pattern = re.compile(r"fps=\s*([\d\.]+)")
-        speed_pattern = re.compile(r"speed=\s*([\d\.x]+)")
-        
-        stderr_lines = []
+        last_edit = 0.0
+        t0 = time.time()
+        stderr_tail = []
+
+        cur_s = 0.0
+        fps = 0.0
+        spd = "0x"
+
         while True:
             if cancel.is_set() or task.cancel_flag.is_set():
-                proc.terminate(); break
-            try:
-                line = await proc.stderr.readuntil(b'\r')
-            except asyncio.exceptions.IncompleteReadError as e:
-                line = e.partial
+                proc.terminate()
+                break
 
-            if not line: break
-            
-            line_str = line.decode('utf-8', errors='ignore').strip()
-            if not line_str: continue
-            
-            stderr_lines.append(line_str)
-            if len(stderr_lines) > 20: stderr_lines.pop(0)
+            line = await proc.stderr.readline()
+            if not line:
+                break
+
+            line_str = line.decode("utf-8", errors="ignore").strip()
+            if not line_str:
+                continue
+
+            stderr_tail.append(line_str)
+            if len(stderr_tail) > 20:
+                stderr_tail.pop(0)
+
+            if "=" in line_str:
+                key, value = line_str.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if key in ("out_time_ms", "out_time_us"):
+                    try:
+                        raw_us = int(value)
+                        cur_s = raw_us / 1_000_000
+                    except:
+                        pass
+                elif key == "speed":
+                    spd = value
+                elif key == "fps":
+                    try:
+                        fps = float(value)
+                    except:
+                        pass
 
             if time.time() - last_edit > REFRESH:
-                time_match = time_pattern.search(line_str)
-                if time_match:
-                    h, m, s = time_match.groups()
-                    cur_s = int(h) * 3600 + int(m) * 60 + float(s)
-                    pct = min(cur_s / (task.duration_s or 1) * 100, 100)
-                    
-                    fps_match = fps_pattern.search(line_str)
-                    fps = float(fps_match.group(1)) if fps_match else 0.0
-                    
-                    spd_match = speed_pattern.search(line_str)
-                    spd = spd_match.group(1) if spd_match else "0x"
-                    
-                    eta = (task.duration_s - cur_s) / (cur_s / (time.time() - t0)) if cur_s > 0 else 0
-                    
-                    txt = pb_enc(spec.label, task.output_name, pct, cur_s, task.duration_s, fps, spd, eta, time.time() - t0)
-                    try:
-                        await prog_msg.edit(txt, reply_markup=qual_cancel_kb(task.task_id, spec.label))
-                        last_edit = time.time()
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except: pass
+                pct = min(cur_s / (task.duration_s or 1) * 100, 100)
+                eta = (task.duration_s - cur_s) / max(cur_s / max(time.time() - t0, 0.01), 1) if cur_s > 0 else 0
+                txt = pb_enc(
+                    spec.label,
+                    task.output_name,
+                    pct,
+                    cur_s,
+                    task.duration_s,
+                    fps,
+                    spd,
+                    eta,
+                    time.time() - t0,
+                )
+                try:
+                    await prog_msg.edit(txt, reply_markup=qual_cancel_kb(task.task_id, spec.label))
+                    last_edit = time.time()
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                except:
+                    pass
 
         await proc.wait()
         task.quality_procs.pop(spec.label, None)
 
         if not (cancel.is_set() or task.cancel_flag.is_set()) and proc.returncode != 0:
-            raise RuntimeError(f"FFmpeg error:\n{chr(10).join(stderr_lines[-10:])}")
+            raise RuntimeError(f"FFmpeg error:\n{chr(10).join(stderr_tail[-10:])}")
 
 # ── UPLOAD ────────────────────────────────────────────────────────────────────
 def build_caption(task: Task, quality: str) -> str:
