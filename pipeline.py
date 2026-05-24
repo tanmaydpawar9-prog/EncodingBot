@@ -531,11 +531,14 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, 
             progress_cb(frame_idx, cues)
 
         frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
+        
+        # 🟢 THE DEBUGGER: Save a few frames to disk so we can physically see what OCR sees!
+        if frame_idx in [100, 300, 500]:
+            cv2.imwrite(f"debug_frame_{frame_idx}.jpg", frame)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, max_val, _, _ = cv2.minMaxLoc(gray)
 
-        # Skip dark frames to save OCR processing time
         if max_val >= 50:
             try: result = engine.ocr(frame, cls=False)
             except Exception: result = None
@@ -558,27 +561,21 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, 
                     cmp_text = _norm_ocr_key(raw_text)
 
                     if len(cmp_text) >= 1:
-                        # OFFSET MATH: Adds the crop back so ASS subtitles align perfectly
                         xs = [p[0] + crop_x for p in ln[0]]
                         ys = [p[1] + crop_y for p in ln[0]]
-                        
-                        x_center = sum(xs) / len(xs)
-                        y_center = sum(ys) / len(ys)
-                        box_w = max(xs) - min(xs)
-                        box_h = max(ys) - min(ys)
                         
                         cues.append({
                             "start": cur_t,
                             "end":   round(cur_t + frame_duration, 3),
                             "text":  raw_text,
                             "cmp":   cmp_text,
-                            "cx":    float(x_center),
-                            "cy":    float(y_center),
+                            "cx":    float(sum(xs) / len(xs)),
+                            "cy":    float(sum(ys) / len(ys)),
                             "max_y": float(max(ys)),
-                            "x":     float(x_center),
-                            "y":     float(y_center),
-                            "bw":    float(box_w),
-                            "bh":    float(box_h),
+                            "x":     float(sum(xs) / len(xs)),
+                            "y":     float(sum(ys) / len(ys)),
+                            "bw":    float(max(xs) - min(xs)),
+                            "bh":    float(max(ys) - min(ys)),
                         })
 
     reader_thread.join()
@@ -586,58 +583,263 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, 
     process.wait()
     return cues
 
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
+    cues = []
+    frame_q = queue.Queue(maxsize=128)
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+    
+    time.sleep(0.5) 
+    if process.poll() is not None and process.returncode != 0:
+        err = process.stderr.read().decode('utf-8')
+        raise RuntimeError(f"FFmpeg crashed on startup. Error details: {err[:200]}")
+
     def _reader():
         idx = 0
         while True:
-            if cancel_check(): proc.terminate(); break
-            raw = proc.stdout.read(bpf)
-            if not raw or len(raw) != bpf: break
-            fq.put((idx, raw)); idx += 1
-        fq.put(None)
+            if cancel_check():
+                process.terminate()
+                break
+            raw = process.stdout.read(bytes_per_frame)
+            if not raw or len(raw) != bytes_per_frame:
+                break
+            frame_q.put((idx, raw))
+            idx += 1
+        frame_q.put(None)
 
-    threading.Thread(target=_reader, daemon=True).start()
-    frame_dur = 1.0 / extract_fps
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    frame_duration = 1.0 / extract_fps
 
     while True:
-        item = fq.get()
-        if item is None: break
-        idx, raw = item
-        cur_t = round((idx / extract_fps) + time_offset, 3)
-        if progress_cb: progress_cb(idx, cues)
+        item = frame_q.get()
+        if item is None:
+            break
 
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3))
+        frame_idx, raw_frame = item
+        cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
 
-        # Skip near-black frames (no text possible)
-        if cv2.minMaxLoc(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))[1] < 30:
-            continue
+        if progress_cb: 
+            progress_cb(frame_idx, cues)
 
-        try:    result = engine.ocr(frame, cls=False)
-        except: result = None
-        if not (result and result[0]): continue
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
+        
+        # 🟢 THE DEBUGGER: Save a few frames to disk so we can physically see what OCR sees!
+        if frame_idx in [100, 300, 500]:
+            cv2.imwrite(f"debug_frame_{frame_idx}.jpg", frame)
 
-        for ln in result[0]:
-            conf = ln[1][1]
-            if conf < 0.25: continue
-            raw_text = ln[1][0].strip()
-            cmp_text = _norm(raw_text)
-            if not cmp_text: continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, max_val, _, _ = cv2.minMaxLoc(gray)
 
-            pts = ln[0]
-            xs  = [p[0] for p in pts]; ys = [p[1] for p in pts]
-            cues.append({
-                "start": cur_t,
-                "end":   round(cur_t + frame_dur, 3),
-                "text":  raw_text,
-                "cmp":   cmp_text,
-                "conf":  conf,
-                "x":     float(sum(xs) / len(xs)),
-                "y":     float(sum(ys) / len(ys)),
-                "bw":    float(max(xs) - min(xs)),
-                "bh":    float(max(ys) - min(ys)),
-            })
+        if max_val >= 50:
+            try: result = engine.ocr(frame, cls=False)
+            except Exception: result = None
 
-    proc.stdout.close(); proc.wait()
+            if result and result[0]:
+                img_w = frame.shape[1]
+                if is_target_res:
+                    centre_lines = [ln for ln in result[0] if ln[1][1] >= 0.25]
+                else:
+                    left_lim  = img_w * 0.10   
+                    right_lim = img_w * 0.80   
+                    centre_lines = [
+                        ln for ln in result[0]
+                        if ln[1][1] >= 0.25  
+                        and left_lim <= sum(p[0] for p in ln[0]) / 4 <= right_lim
+                    ]
+                    
+                for ln in centre_lines:
+                    raw_text = ln[1][0].strip()
+                    cmp_text = _norm_ocr_key(raw_text)
+
+                    if len(cmp_text) >= 1:
+                        xs = [p[0] + crop_x for p in ln[0]]
+                        ys = [p[1] + crop_y for p in ln[0]]
+                        
+                        cues.append({
+                            "start": cur_t,
+                            "end":   round(cur_t + frame_duration, 3),
+                            "text":  raw_text,
+                            "cmp":   cmp_text,
+                            "cx":    float(sum(xs) / len(xs)),
+                            "cy":    float(sum(ys) / len(ys)),
+                            "max_y": float(max(ys)),
+                            "x":     float(sum(xs) / len(xs)),
+                            "y":     float(sum(ys) / len(ys)),
+                            "bw":    float(max(xs) - min(xs)),
+                            "bh":    float(max(ys) - min(ys)),
+                        })
+
+    reader_thread.join()
+    process.stdout.close()
+    process.wait()
     return cues
+
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
+    cues = []
+    frame_q = queue.Queue(maxsize=128)
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+    
+    time.sleep(0.5) 
+    if process.poll() is not None and process.returncode != 0:
+        err = process.stderr.read().decode('utf-8')
+        raise RuntimeError(f"FFmpeg crashed on startup. Error details: {err[:200]}")
+
+    def _reader():
+        idx = 0
+        while True:
+            if cancel_check():
+                process.terminate()
+                break
+            raw = process.stdout.read(bytes_per_frame)
+            if not raw or len(raw) != bytes_per_frame:
+                break
+            frame_q.put((idx, raw))
+            idx += 1
+        frame_q.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    frame_duration = 1.0 / extract_fps
+
+    while True:
+        item = frame_q.get()
+        if item is None:
+            break
+
+        frame_idx, raw_frame = item
+        cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
+
+        if progress_cb: 
+            progress_cb(frame_idx, cues)
+
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
+        
+        # 🟢 THE DEBUGGER: Save a few frames to disk so we can physically see what OCR sees!
+        if frame_idx in [100, 300, 500]:
+            cv2.imwrite(f"debug_frame_{frame_idx}.jpg", frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, max_val, _, _ = cv2.minMaxLoc(gray)
+
+        if max_val >= 50:
+            try: result = engine.ocr(frame, cls=False)
+            except Exception: result = None
+
+            if result and result[0]:
+                img_w = frame.shape[1]
+                if is_target_res:
+                    centre_lines = [ln for ln in result[0] if ln[1][1] >= 0.25]
+                else:
+                    left_lim  = img_w * 0.10   
+                    right_lim = img_w * 0.80   
+                    centre_lines = [
+                        ln for ln in result[0]
+                        if ln[1][1] >= 0.25  
+                        and left_lim <= sum(p[0] for p in ln[0]) / 4 <= right_lim
+                    ]
+                    
+                for ln in centre_lines:
+                    raw_text = ln[1][0].strip()
+                    cmp_text = _norm_ocr_key(raw_text)
+
+                    if len(cmp_text) >= 1:
+                        xs = [p[0] + crop_x for p in ln[0]]
+                        ys = [p[1] + crop_y for p in ln[0]]
+                        
+                        cues.append({
+                            "start": cur_t,
+                            "end":   round(cur_t + frame_duration, 3),
+                            "text":  raw_text,
+                            "cmp":   cmp_text,
+                            "cx":    float(sum(xs) / len(xs)),
+                            "cy":    float(sum(ys) / len(ys)),
+                            "max_y": float(max(ys)),
+                            "x":     float(sum(xs) / len(xs)),
+                            "y":     float(sum(ys) / len(ys)),
+                            "bw":    float(max(xs) - min(xs)),
+                            "bh":    float(max(ys) - min(ys)),
+                        })
+
+    reader_thread.join()
+    process.stdout.close()
+    process.wait()
+    return cues
+
+def run_ocr_pipeline(task: Task, video_path: str, status_msg, start_sec=0.0, end_sec=None, cancel_check=None):
+    if cancel_check is None: cancel_check = lambda: False
+
+    _cap = cv2.VideoCapture(video_path)
+    native_fps = _cap.get(cv2.CAP_PROP_FPS) or 24.0
+    cv2_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    _cap.release()
+
+    duration = get_real_duration(video_path)
+    if duration <= 0:
+        duration = cv2_frames / native_fps if native_fps > 0 else 0
+        
+    if start_sec is None or start_sec < 0: start_sec = 0.0
+    if end_sec is None or end_sec > duration: end_sec = duration
+
+    process_duration = end_sec - start_sec
+    extract_fps = native_fps
+    src_total_frames = int(process_duration * extract_fps)
+
+    scale = min(1920, orig_w) / max(orig_w, 1)
+    s_w = int(orig_w * scale)
+    s_h = int(orig_h * scale)
+
+    task.ocr_res_w = s_w
+    task.ocr_res_h = s_h
+
+    # Removed X cropping completely to ensure we don't chop side text
+    crop_x = 0
+    crop_w = s_w
+    is_target_res = True 
+
+    s_w -= s_w % 2
+    s_h -= s_h % 2
+    crop_w -= crop_w % 2
+
+    # 🟢 INCREASED CROP TO 35% TO PREVENT GUILLOTINE EFFECT
+    crop_y = int(s_h * 0.65)
+    crop_y -= crop_y % 2
+    crop_h = int(s_h * 0.35)
+    crop_h -= crop_h % 2
+    
+    bytes_per_frame = crop_w * crop_h * 3
+    vf_str = f"scale={s_w}:{s_h},crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+
+    scan_t0 = time.time()
+    
+    # 🟢 REMOVED HWACCEL CUDA. We use raw CPU extraction to prevent corrupted NV12 memory pipelines
+    cmd = [
+        "ffmpeg", "-v", "error", "-y", 
+        "-threads", "8",
+        "-ss", str(start_sec),
+        "-i", video_path, 
+        "-t", str(process_duration),
+        "-vf", vf_str, 
+        "-r", str(extract_fps), 
+        "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+    ]
+    
+    engine = _load_ocr(0)
+    last_ui = [time.time()]
+
+    def _progress(f_idx, cues_list):
+        now = time.time()
+        if now - last_ui[0] > REFRESH:
+            last_ui[0] = now
+            push(status_msg, pb_frames('Direct Stream OCR', f_idx, src_total_frames, scan_t0, f"💬 Cues: {len(cues_list)}"), CANCEL_BTN)
+
+    raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, start_sec, cancel_check, is_target_res, progress_cb=_progress)
+    return stitch_continuous_lines(raw_subs)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Full-frame OCR pipeline
