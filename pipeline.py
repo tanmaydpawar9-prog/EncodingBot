@@ -1,47 +1,88 @@
+#!/usr/bin/env python3
+# ══════════════════════════════════════════════════════════════════════════════
+#  TheFrictionRealm Combined Bot — Lightning AI / RTX A6000 Edition
+# ══════════════════════════════════════════════════════════════════════════════
+
 import os
 import sys
-import time
-import re
-import subprocess
-import logging
-import asyncio
-import requests
-import http.server
-import socketserver
-import threading
-import shutil
-import concurrent.futures
-import uuid
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from pyrogram.errors import FloodWait
 
 # --- Lightning AI GPU Fix ---
-# Ensures FFmpeg can find libcuda.so.1 for the RTX 6000 NVENC encoder
+# Ensures FFmpeg can find libcuda.so.1 for the RTX A6000 NVENC encoder
 cuda_paths = "/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/usr/lib64:/lib64"
 os.environ['LD_LIBRARY_PATH'] = f"{cuda_paths}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
-# --- Basic Bot Logging ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+import re, time, json, shutil, asyncio, logging
+import subprocess, difflib, threading, queue, traceback, io, uuid
+import requests, concurrent.futures
+import http.server, socketserver
+from pathlib import Path
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional
 
-# ==========================================
-# 0. HTTP Server for Large File Downloads
-# ==========================================
+import cv2, yt_dlp, numpy as np, nest_asyncio
+nest_asyncio.apply()
+
+from kaggle_secrets import UserSecretsClient
+from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
+from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
+from openai import AsyncOpenAI
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger("FrBot")
+
+# Fallback to os.environ if Kaggle secrets aren't available (useful for Lightning AI)
+try:
+    _sec = UserSecretsClient()
+    API_ID       = int(_sec.get_secret("API_ID") or os.getenv("API_ID", 0))
+    API_HASH     = _sec.get_secret("API_HASH") or os.getenv("API_HASH", "")
+    BOT_TOKEN    = _sec.get_secret("BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+    OPENAI_KEY   = _sec.get_secret("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+except Exception:
+    API_ID       = int(os.getenv("API_ID", 0))
+    API_HASH     = os.getenv("API_HASH", "")
+    BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
+    OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "")
+
+ADMIN_IDS       = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+CHANNEL_MAP_RAW = os.environ.get("CHANNEL_MAP", "")
+
+BASE  = Path("./frbot_work")
+FILES = BASE / "files"
+TMP   = BASE / "tmp"
+WORK  = BASE / "work"
+for _d in [FILES, TMP, WORK]: _d.mkdir(parents=True, exist_ok=True)
+
+EVENT_LOOP     = None
+REFRESH        = 5       # UI update interval (seconds)
+UPLOAD_TAG     = "TheFrictionRealm"
+MIN_GAP_SEC    = 0.04
+_OCR_ENGINES   = {}
+
+# RTX A6000 Concurrency Controls
+dl_semaphore  = asyncio.Semaphore(4)   # Max concurrent downloads
+mux_semaphore = asyncio.Semaphore(3)   # Unrestricted NVENC allows 3+ parallel encodes
+ul_semaphore  = asyncio.Semaphore(6)   # Max concurrent Telegram uploads
+
+# ── HTTP SERVER FOR >2GB FILES ────────────────────────────────────────────────
 HTTP_PORT = 8000
 http_server_thread = None
 server_lock = threading.Lock()
-file_id_map = {} # Maps a unique ID to a file path
+file_id_map = {} 
 
 class CustomHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
-    """A custom handler that serves files based on a UUID map."""
     def do_GET(self):
         if self.path.startswith('/download/'):
             file_id = self.path.split('/')[-1]
             file_path = file_id_map.get(file_id)
-            
             if file_path and os.path.exists(file_path):
                 try:
                     with open(file_path, 'rb') as f:
@@ -53,7 +94,7 @@ class CustomHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                         self.end_headers()
                         shutil.copyfileobj(f, self.wfile)
                 except Exception as e:
-                    logger.error(f"HTTP server error serving file: {e}")
+                    log.error(f"HTTP server error serving file: {e}")
                     self.send_error(500, "Server error while serving file")
             else:
                 self.send_error(404, "File not found or link expired")
@@ -61,328 +102,542 @@ class CustomHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            self.wfile.write(b"Encoding Bot File Server is running.")
+            self.wfile.write(b"TheFrictionRealm File Server is running.")
 
 def start_http_server():
-    """Starts a simple HTTP server in a background thread if not already running."""
     global http_server_thread
     with server_lock:
         if http_server_thread is None or not http_server_thread.is_alive():
             httpd = socketserver.TCPServer(("", HTTP_PORT), CustomHTTPRequestHandler)
-            
             def serve():
-                logger.info(f"Starting HTTP server on port {HTTP_PORT} to serve files.")
+                log.info(f"Starting HTTP server on port {HTTP_PORT} to serve large files.")
                 httpd.serve_forever()
-                
             http_server_thread = threading.Thread(target=serve, daemon=True)
             http_server_thread.start()
-            logger.info("HTTP server thread started.")
 
-# ==========================================
-# 1. Custom Progress Bar Formatting
-# ==========================================
-class PyrogramProgressViewer:
-    def __init__(self, message, action="Downloading", chat_id=None):
-        self.message = message
-        self.action = action
-        self.chat_id = chat_id
-        self.start_time = time.time()
-        self.last_update = 0
-        self.last_text = ""
+# ── QUALITY PROFILES ─────────────────────────────────────────────────────────
+@dataclass
+class QualitySpec:
+    label: str; width: int; height: int
 
-    async def update(self, current, total):
-        # Abort if user triggered the cancel button
-        if self.chat_id and active_jobs.get(self.chat_id, {}).get('cancel'):
-            raise Exception("User Cancelled")
-            
-        now = time.time()
-        # Throttled to 5s for faster updates (FloodWait handler protects against crashes)
-        if now - self.last_update < 5 and current < total:
-            return
-        self.last_update = now
-        
-        elapsed = now - self.start_time
-        if elapsed < 0.1: elapsed = 0.1
-        
-        speed = current / elapsed
-        
-        if total and total > 0:
-            progress_pct = (current / total) * 100
-            eta_sec = (total - current) / speed if speed > 0 else 0
-            tot_mb_str = f"{total / 1048576:.1f}MB"
+QUALITY_SPECS = [
+    QualitySpec("2K",    2560, 1440),
+    QualitySpec("1080p", 1920, 1080),
+    QualitySpec("720p",  1280,  720),
+]
+
+# ── STATE MACHINE ─────────────────────────────────────────────────────────────
+class Mode(Enum):
+    OCR = "ocr"
+    ENC = "enc"
+
+class Stage(Enum):
+    IDLE        = auto()
+    AWAIT_SRC   = auto()
+    DOWNLOADING = auto()
+    AWAIT_CUT   = auto()
+    OCR_RUNNING = auto()
+    AWAIT_SUB   = auto()
+    AWAIT_NAME  = auto()
+    AWAIT_THUMB = auto()
+    CONFIRMING  = auto()
+    MUXING      = auto()
+    ENCODING    = auto()
+    DONE        = auto()
+    CANCELLED   = auto()
+
+# ── TASK DATACLASS ────────────────────────────────────────────────────────────
+@dataclass
+class Task:
+    task_id:  str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    mode:     Mode  = Mode.OCR
+    chat_id:  int   = 0
+    user_id:  int   = 0
+    stage:    Stage = Stage.IDLE
+
+    # Paths
+    work_dir:      Optional[Path] = None
+    input_path:    Optional[Path] = None
+    subtitle_path: Optional[Path] = None
+    muxed_path:    Optional[Path] = None
+    thumb_path:    Optional[Path] = None
+
+    # Naming
+    output_name:  str = ""
+    raw_name:     str = ""
+    series_name:  str = ""
+    episode_tag:  str = ""
+
+    # Video metadata
+    duration_s:  float = 0.0
+    src_bitrate: int   = 0
+    src_width:   int   = 0
+    src_height:  int   = 0
+
+    # OCR results
+    ocr_subs: list = field(default_factory=list)
+
+    # Cancellation
+    cancel_flag:          Optional[asyncio.Event] = None
+    quality_cancel_flags: dict = field(default_factory=dict)
+    quality_procs:        dict = field(default_factory=dict)
+    quality_msgs:         dict = field(default_factory=dict)
+    encode_done_flags:    dict = field(default_factory=dict)
+    encoded_files:        dict = field(default_factory=dict)
+
+    # User-input futures
+    src_future:      Optional[asyncio.Future] = None
+    cut_future:      Optional[asyncio.Future] = None
+    subtitle_future: Optional[asyncio.Future] = None
+    name_future:     Optional[asyncio.Future] = None
+    thumb_future:    Optional[asyncio.Future] = None
+    confirm_future:  Optional[asyncio.Future] = None
+
+    status_msg:  Optional[object] = None
+    started_at:  float = field(default_factory=time.time)
+
+# Global registry keyed by chat_id
+active_tasks: dict[int, Task] = {}
+
+def new_task(mode: Mode, chat_id: int, user_id: int) -> Task:
+    loop = asyncio.get_running_loop()
+    t = Task(mode=mode, chat_id=chat_id, user_id=user_id)
+    t.work_dir       = WORK / t.task_id
+    t.work_dir.mkdir(parents=True, exist_ok=True)
+    t.cancel_flag    = asyncio.Event()
+    t.src_future     = loop.create_future()
+    t.cut_future     = loop.create_future()
+    t.subtitle_future= loop.create_future()
+    t.name_future    = loop.create_future()
+    t.thumb_future   = loop.create_future()
+    t.confirm_future = loop.create_future()
+    return t
+
+def cleanup_task(t: Task):
+    # Only pop from active_tasks if this specific task is still the one locked to the chat
+    # (prevents deleting the lock for a new job if they overlapped)
+    if active_tasks.get(t.chat_id) is t:
+        active_tasks.pop(t.chat_id, None)
+    if t.work_dir and t.work_dir.exists():
+        shutil.rmtree(t.work_dir, ignore_errors=True)
+
+def is_admin(uid: int) -> bool:
+    return (not ADMIN_IDS) or (uid in ADMIN_IDS)
+
+def _cancel_all_futures(t: Task):
+    for fut in [t.src_future, t.cut_future, t.subtitle_future, t.name_future, t.thumb_future, t.confirm_future]:
+        if fut and not fut.done():
+            try: fut.cancel()
+            except: pass
+
+# ── UI HELPERS ────────────────────────────────────────────────────────────────
+def fmt_bytes(b: float) -> str:
+    if not b: return "0.00 B"
+    for u in ["B", "Kʙ", "Mʙ", "Gʙ", "Tʙ"]:
+        if b < 1024: return f"{b:.2f} {u}"
+        b /= 1024
+    return f"{b:.2f} Pʙ"
+
+def fmt_time(s: float) -> str:
+    s = int(max(s, 0))
+    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h}h {m}m {sec}s" if h else f"{m}m {sec}s"
+
+def prog_bar(pct: float, w: int = 10) -> str:
+    f = round(min(pct, 100) / 100 * w)
+    return "■" * f + "□" * (w - f)
+
+def pb_bytes(action: str, cur: int, total: int, t0: float) -> str:
+    el  = time.time() - t0
+    spd = cur / max(el, 0.01)
+    pct = cur / total * 100 if total else 0
+    eta = (total - cur) / max(spd, 1) if total else 0
+    return (
+        f"Progress: [{prog_bar(pct)}] {pct:.1f}%\n"
+        f"📥 {action}: {fmt_bytes(cur)} | {fmt_bytes(total)}\n"
+        f"⚡️ Speed: {fmt_bytes(spd)}/s\n"
+        f"⌛ ETA: {fmt_time(eta)}\n"
+        f"⏱️ Elapsed: {fmt_time(el)}"
+    )
+
+def pb_frames(action: str, cur: int, total: int, t0: float, extra: str = "") -> str:
+    el  = time.time() - t0
+    spd = cur / max(el, 0.01)
+    pct = cur / total * 100 if total else 0
+    eta = (total - cur) / max(spd, 1) if total else 0
+    base = (
+        f"Progress: [{prog_bar(pct)}] {pct:.1f}%\n"
+        f"⚡ {action}: {int(cur)} | {int(total)} frames\n"
+        f"⚡️ Speed: {spd:.1f} fps\n"
+        f"⌛ ETA: {fmt_time(eta)}\n"
+        f"⏱️ Elapsed: {fmt_time(el)}"
+    )
+    return base + (f"\n{extra}" if extra else "")
+
+def pb_enc(label: str, name: str, pct: float, cur_s: float, tot_s: float, fps: float, spd: str, eta: float, el: float) -> str:
+    return (
+        f"🎬 **Encoding [{label}] · {name}**\n\n"
+        f"Progress: `[{prog_bar(pct)}] {pct:.1f}%`\n"
+        f"⏱️ Encoded: `{fmt_time(cur_s)}` / `{fmt_time(tot_s)}`\n"
+        f"⚡️ Speed: `{spd}` | `{fps:.0f} fps`\n"
+        f"⌛ ETA: `{fmt_time(eta)}`\n"
+        f"🕐 Elapsed: `{fmt_time(el)}`"
+    )
+
+def pb_up(label: str, name: str, cur: int, total: int, t0: float) -> str:
+    el  = time.time() - t0
+    spd = cur / max(el, 0.01)
+    pct = cur / total * 100 if total else 0
+    eta = (total - cur) / max(spd, 1) if total else 0
+    return (
+        f"📤 **Uploading [{label}] · {name}**\n\n"
+        f"Progress: `[{prog_bar(pct)}] {pct:.1f}%`\n"
+        f"📤 `{fmt_bytes(cur)}` | `{fmt_bytes(total)}`\n"
+        f"⚡️ Speed: `{fmt_bytes(spd)}/s`\n"
+        f"⌛ ETA: `{fmt_time(eta)}`\n"
+        f"🕐 Elapsed: `{fmt_time(el)}`"
+    )
+
+CANCEL_BTN = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancel Task", callback_data="cancel_active")]])
+
+def qual_cancel_kb(task_id: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"❌ Cancel {label}", callback_data=f"cq:{task_id}:{label}")]])
+
+def confirm_kb(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start Encode", callback_data=f"start:{task_id}"),
+         InlineKeyboardButton("❌ Cancel",        callback_data=f"cancel:{task_id}")]
+    ])
+
+async def safe_edit(msg, text: str, markup=None):
+    try: await msg.edit_text(text, reply_markup=markup)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception: pass
+
+def push(msg, text: str, markup=None):
+    if EVENT_LOOP and msg:
+        asyncio.run_coroutine_threadsafe(safe_edit(msg, text, markup), EVENT_LOOP)
+
+def channel_map() -> dict[str, int]:
+    r = {}
+    for e in CHANNEL_MAP_RAW.split(","):
+        e = e.strip()
+        if ":" not in e: continue
+        n, cid = e.rsplit(":", 1)
+        try: r[n.strip().lower()] = int(cid.strip())
+        except: pass
+    return r
+
+def resolve_channel(series: str) -> Optional[int]:
+    sl = series.lower()
+    for kw, cid in channel_map().items():
+        if kw in sl or sl in kw: return cid
+    return None
+
+# ── PYROGRAM CLIENT ───────────────────────────────────────────────────────────
+app = Client(
+    "friction_combined",
+    api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+    max_concurrent_transmissions=8,
+    in_memory=True,
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OCR ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+def _load_ocr(gpu_id: int = 0):
+    if gpu_id not in _OCR_ENGINES:
+        from paddleocr import PaddleOCR
+        try:
+            import paddle
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.set_device(f"gpu:{gpu_id}")
+            _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=True, gpu_id=gpu_id, show_log=False)
+            log.info(f"PaddleOCR ready on GPU:{gpu_id}")
+        except Exception as e:
+            log.warning(f"GPU:{gpu_id} failed ({e}) → CPU fallback")
+            _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=False, show_log=False)
+    return _OCR_ENGINES[gpu_id]
+
+def _sub_key(cue: dict) -> str:
+    return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", cue.get("cmp") or cue.get("text") or "")
+
+def _same_sub(a: dict, b: dict, thr: float = 0.75) -> bool:
+    ak, bk = _sub_key(a), _sub_key(b)
+    if not ak or not bk: return False
+    if ak == bk: return True
+    return difflib.SequenceMatcher(None, ak, bk).ratio() >= thr
+
+def stitch_continuous_lines(subs: list, max_gap: float = 0.15) -> list:
+    if not subs: return []
+    stitched = [subs[0].copy()]
+    for cur in subs[1:]:
+        prev = stitched[-1]
+        gap  = cur["start"] - prev["end"]
+        if gap <= max_gap and _same_sub(prev, cur):
+            prev["end"] = max(prev["end"], cur["end"])
+            if len(cur.get("cmp", "")) > len(prev.get("cmp", "")):
+                prev["text"] = cur.get("text", prev["text"])
+                prev["cmp"]  = cur.get("cmp",  prev.get("cmp", ""))
+            continue
+        if gap < 0:
+            overlap  = prev["end"] - cur["start"]
+            midpoint = prev["end"] - (overlap / 2.0)
+            prev["end"] = round(midpoint - (MIN_GAP_SEC / 2.0), 3)
+            cur_c = cur.copy()
+            cur_c["start"] = round(midpoint + (MIN_GAP_SEC / 2.0), 3)
+            if prev["end"] - prev["start"] < 0.08: stitched.pop()
+            if cur_c["end"] - cur_c["start"] >= 0.08: stitched.append(cur_c)
         else:
-            progress_pct = 0
-            eta_sec = 0
-            tot_mb_str = "Unknown Size"
-        
-        # [■■■■■■□□□□] exact design match
-        filled = int(progress_pct / 10)
-        bar = '■' * filled + '□' * (10 - filled)
-        
-        text = (
-            f"Progress: [{bar}] {progress_pct:.1f}%\n"
-            f"⚙️ {self.action}: {current / 1048576:.1f}MB of {tot_mb_str}\n"
-            f"⚡ Speed: {speed / 1048576:.1f}MB/s\n"
-            f"⌛ ETA: {time.strftime('%Hh %Mm %Ss', time.gmtime(eta_sec))}\n"
-            f"⏱️ Time elapsed: {time.strftime('%Mm %Ss', time.gmtime(elapsed))}."
-        )
-        
-        if text != self.last_text:
-            try:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Cancel Job", callback_data="cancel_job")]
-                ])
-                await self.message.edit_text(text, reply_markup=keyboard)
-                self.last_text = text
-            except FloodWait as e:
-                # If Telegram rate-limits us, automatically pause to respect the limit
-                await asyncio.sleep(e.value)
-            except Exception:
-                pass
+            stitched.append(cur.copy())
+    return stitched
 
-class EncodingProgressViewer:
-    def __init__(self, message, chat_id=None):
-        self.message = message
-        self.chat_id = chat_id
-        self.start_time = time.time()
-        self.last_update = 0
-        self.last_text = ""
+def _norm_ocr_key(txt: str) -> str:
+    return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
-    async def update(self, current_sec, total_sec, fps, speed):
-        if self.chat_id and active_jobs.get(self.chat_id, {}).get('cancel'):
-            raise Exception("User Cancelled")
-            
-        now = time.time()
-        if now - self.last_update < 5 and current_sec < total_sec:
-            return
-        self.last_update = now
-        
-        elapsed = now - self.start_time
-        if elapsed < 0.1: elapsed = 0.1
-        
-        if total_sec > 0:
-            progress_pct = min((current_sec / total_sec) * 100, 100.0)
-            eta_sec = (total_sec - current_sec) / (current_sec / elapsed) if current_sec > 0 else 0
-        else:
-            progress_pct = 0
-            eta_sec = 0
-            
-        filled = int(progress_pct / 10)
-        bar = '■' * filled + '□' * (10 - filled)
-        
-        text = (
-            f"Progress: [{bar}] {progress_pct:.1f}%\n"
-            f"🎬 Encoding: {time.strftime('%H:%M:%S', time.gmtime(current_sec))} / {time.strftime('%H:%M:%S', time.gmtime(total_sec))}\n"
-            f"⚡ Speed: {fps} fps ({speed})\n"
-            f"⌛ ETA: {time.strftime('%Hh %Mm %Ss', time.gmtime(eta_sec))}\n"
-            f"⏱️ Time elapsed: {time.strftime('%Mm %Ss', time.gmtime(elapsed))}."
-        )
-        
-        if text != self.last_text:
-            try:
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Job", callback_data="cancel_job")]])
-                await self.message.edit_text(text, reply_markup=keyboard)
-                self.last_text = text
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception:
-                pass
+def suppress_static_overlay_cues(subs: list, frame_w: int, frame_h: int, total_dur: float) -> list:
+    # Simplified suppression wrapper for stability
+    if not subs: return []
+    kept = sorted(subs, key=lambda x: x["start"])
+    return kept
 
-# ==========================================
-# 2 & 3. Naming and Size/Bitrate Logic
-# ==========================================
-def process_metadata(original_name, quality_choice):
-    """Replaces [4K], [1080P], etc., with the user's chosen output quality."""
-    pattern = r'(?i)\[(4k|2k|1080p|720p|360p)\]'
-    new_name = re.sub(pattern, f'[{quality_choice.upper()}]', original_name)
-    
-    if new_name == original_name:
-        base, ext = os.path.splitext(original_name)
-        new_name = f"{base} [{quality_choice.upper()}]{ext}"
-        
-    # Force .mkv extension to support all streams and avoid weird MP4 containers
-    base, _ = os.path.splitext(new_name)
-    new_name = f"{base}.mkv"
-        
-    # Ensure the output is in the downloads directory for serving
-    return os.path.join("downloads", os.path.basename(new_name))
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
+    cues    = []
+    frame_q = queue.Queue(maxsize=128)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+    time.sleep(0.5)
+    if process.poll() is not None and process.returncode != 0:
+        raise RuntimeError("FFmpeg pipe crashed on startup.")
 
-def get_target_bitrate(input_file, quality_choice):
-    """Dynamically calculates bitrate scaling."""
-    cmd = [
-        'ffprobe', '-v', 'error', '-show_entries', 'format=bit_rate', 
-        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
-    ]
-    original_bitrate = 16_000_000
+    def _reader():
+        idx = 0
+        while True:
+            if cancel_check(): process.terminate(); break
+            raw = process.stdout.read(bytes_per_frame)
+            if not raw or len(raw) != bytes_per_frame: break
+            frame_q.put((idx, raw)); idx += 1
+        frame_q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    frame_dur = 1.0 / extract_fps
+
+    while True:
+        item = frame_q.get()
+        if item is None: break
+        frame_idx, raw_frame = item
+        cur_t = round((frame_idx / float(extract_fps)) + time_offset, 3)
+        if progress_cb: progress_cb(frame_idx, cues)
+
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((crop_h, crop_w, 3))
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, max_val, _, _ = cv2.minMaxLoc(gray)
+
+        if max_val >= 50:
+            try:    result = engine.ocr(frame, cls=False)
+            except: result = None
+
+            if result and result[0]:
+                for ln in result[0]:
+                    raw_text = ln[1][0].strip()
+                    cmp_text = _norm_ocr_key(raw_text)
+                    if len(cmp_text) >= 1 and ln[1][1] >= 0.25:
+                        xs = [p[0] for p in ln[0]]; ys = [p[1] for p in ln[0]]
+                        cues.append({
+                            "start": cur_t, "end": round(cur_t + frame_dur, 3),
+                            "text": raw_text, "cmp": cmp_text,
+                            "x": sum(xs)/len(xs), "y": sum(ys)/len(ys),
+                            "bw": max(xs)-min(xs), "bh": max(ys)-min(ys),
+                        })
+
+    process.stdout.close(); process.wait()
+    return cues
+
+def get_real_duration(path: str) -> float:
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if res.stdout:
-            out = res.stdout.strip()
-            if out and out.lower() != 'n/a':
-                original_bitrate = int(out)
-    except Exception as e:
-        logger.warning(f"Could not get original bitrate via ffprobe: {e}. Falling back to default.")
+        out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path])
+        return float(out.decode().strip())
+    except: return 0.0
 
-    qual = quality_choice.upper()
-    
-    if '2K' in qual:
-        br = int(original_bitrate * 0.75)
-    elif '1080' in qual:
-        br = int(original_bitrate * 0.5)
-    elif '720' in qual:
-        br = int(original_bitrate * 0.25)
-    else:
-        br = original_bitrate
-    
-    return max(br, 500_000) # Prevents NVENC from crashing with a 0 or extremely low bitrate
+def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
+    if cancel_check is None: cancel_check = lambda: False
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w, orig_h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
 
-def get_video_duration(input_file):
-    """Gets the total duration of the video in seconds."""
-    cmd = [
-        'ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
-    ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if res.stdout:
-            out = res.stdout.strip()
-            if out and out.lower() != 'n/a':
-                return float(out)
-    except Exception as e:
-        logger.warning(f"Could not get video duration from format: {e}. Trying stream duration.")
-        
-    # Fallback to video stream duration (specifically for MKV files)
-    cmd_stream = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
-    try:
-        res = subprocess.run(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if res.stdout:
-            out = res.stdout.strip()
-            if out and out.lower() != 'n/a':
-                return float(out.split('\n')[0])
-    except Exception as e:
-        logger.warning(f"Could not get video duration from stream: {e}. Fallback to 0.")
-    return 0.0
+    duration = get_real_duration(video_path) or (frames / fps if fps else 0)
+    if start_sec is None or start_sec < 0: start_sec = 0.0
+    if end_sec is None or end_sec > duration: end_sec = duration
 
-# ==========================================
-# Fast Download, Encode, and Upload 
-# ==========================================
+    proc_dur = end_sec - start_sec
+    extract_fps = fps
+    total_frames = int(proc_dur * extract_fps)
 
-def _download_range(url, start, end, output_path, progress_list, idx, chat_id):
+    scale = min(1920, orig_w) / max(orig_w, 1)
+    s_w, s_h = int(orig_w * scale), int(orig_h * scale)
+    s_w -= s_w % 2; s_h -= s_h % 2
+    t0 = time.time()
+
+    def make_cmd(ss, dur, vf, thr="4"):
+        return [
+            "ffmpeg", "-v", "error", "-y", "-hwaccel", "cuda", "-threads", thr,
+            "-ss", str(ss), "-i", video_path, "-t", str(dur),
+            "-vf", vf, "-r", str(extract_fps),
+            "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        ]
+
+    def _run_once(band_ratio: float):
+        crop_w = s_w
+        crop_y = int(s_h * (1.0 - band_ratio)) & ~1
+        crop_h = int(s_h * band_ratio) & ~1
+
+        crop_w = max(crop_w - (crop_w % 2), 2)
+        crop_h = max(crop_h - (crop_h % 2), 2)
+        crop_y = max(crop_y, 0)
+        bpf = crop_w * crop_h * 3
+        vf  = f"scale={s_w}:{s_h},crop={crop_w}:{crop_h}:0:{crop_y}"
+
+        engine = _load_ocr(0)
+        last_ui = [time.time()]
+
+        def _progress(fi, cl):
+            if time.time() - last_ui[0] > REFRESH:
+                last_ui[0] = time.time()
+                push(status_msg, pb_frames("Direct Stream OCR", fi, total_frames, t0, f"💬 Cues: {len(cl)}"), CANCEL_BTN)
+
+        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, True, _progress)
+        raw = stitch_continuous_lines(raw)
+        return suppress_static_overlay_cues(raw, crop_w, crop_h, proc_dur)
+
+    # 22% strict limit enforced here
+    final_subs = _run_once(0.22)
+    return final_subs
+
+# ── CHATGPT TRANSLATION ───────────────────────────────────────────────────────
+async def batch_translate(zh_texts: list, status_msg=None, chat_id: int = None) -> list:
+    if not OPENAI_KEY: return ["[No API Key]"] * len(zh_texts)
+    client = AsyncOpenAI(api_key=OPENAI_KEY)
+    BATCH = 50; res = []; t0 = time.time()
+    sys_p = (
+        "You are an expert translator for Chinese Donghua, Xianxia, and Wuxia animation. "
+        "Translate the following Chinese subtitles into natural, flowing English. "
+        "Keep cultivation terms and titles epic and accurate. "
+        "Return ONLY a numbered list matching the input numbering exactly. "
+        "Do not merge lines, skip lines, or add commentary."
+    )
+    for i in range(0, len(zh_texts), BATCH):
+        task = active_tasks.get(chat_id)
+        if task and task.cancel_flag.is_set(): break
+        if status_msg: push(status_msg, pb_frames("ChatGPT Translating", i, len(zh_texts), t0), CANCEL_BTN)
+        chunk = zh_texts[i:i + BATCH]
+        chunk_text = "\n".join(f"{j} | {t}" for j, t in enumerate(chunk))
+        try:
+            resp = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": chunk_text}],
+                temperature=0.1,
+            )
+            reply = resp.choices[0].message.content.strip()
+            out = ["[Translation Error]"] * len(chunk)
+            for line in reply.split("\n"):
+                line = line.strip()
+                if not line: continue
+                m = re.match(r"^\*?\*?(\d+)\*?\*?\s*[|\-]\s*(.*)", line)
+                if m:
+                    idx, txt = int(m.group(1)), m.group(2).strip()
+                    if 0 <= idx < len(chunk):
+                        if out[idx] == "[Translation Error]": out[idx] = txt
+                        else: out[idx] += " " + txt
+            res.extend(out)
+        except Exception as e:
+            log.error(f"ChatGPT error: {e}")
+            res.extend(chunk)
+    return res
+
+def srt_ts(sec: float) -> str:
+    ms = int(round((sec % 1) * 1000))
+    if ms >= 1000: sec += 1; ms = 0
+    s, m, h = int(sec) % 60, (int(sec) // 60) % 60, int(sec) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def write_srt(subs: list, texts: list, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        for i, (sub, txt) in enumerate(zip(subs, texts), 1):
+            f.write(f"{i}\n{srt_ts(sub['start'])} --> {srt_ts(sub['end'])}\n{txt}\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOWNLOAD HELPERS (Parallel + yt-dlp)
+# ══════════════════════════════════════════════════════════════════════════════
+_ydl_last_ui: dict[int, float] = {}
+def _ydl_hook(d, msg, chat_id: int, t0: float):
+    task = active_tasks.get(chat_id)
+    if task and task.cancel_flag.is_set(): raise Exception("Cancelled")
+    now = time.time()
+    if d["status"] == "downloading" and now - _ydl_last_ui.get(chat_id, 0) > REFRESH:
+        _ydl_last_ui[chat_id] = now
+        cur = d.get("downloaded_bytes", 0)
+        tot = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+        push(msg, pb_bytes("yt-dlp", cur, tot, t0), CANCEL_BTN)
+
+def dl_ytdlp(url: str, chat_id: int, msg_id: int, status_msg=None) -> str:
+    t0 = time.time()
+    dest = str(FILES / f"{chat_id}_{msg_id}.%(ext)s")
+    opts = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": dest, "merge_output_format": "mkv",
+        "quiet": True, "nocheckcertificate": True,
+        "external_downloader": "aria2c",
+        "external_downloader_args": ["-x", "16", "-s", "16", "-k", "1M"],
+        "progress_hooks": ([lambda d: _ydl_hook(d, status_msg, chat_id, t0)] if status_msg else []),
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.prepare_filename(ydl.extract_info(url, download=True))
+
+def _download_range(url, start, end, output_path, progress_list, idx, task):
     retries = 15
-
     for attempt in range(retries):
         current_start = start + progress_list[idx]
-        if current_start > end:
-            return
-        headers = {
-            "Range": f"bytes={current_start}-{end}", 
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+        if current_start > end: return
+        headers = {"Range": f"bytes={current_start}-{end}", "User-Agent": "Mozilla/5.0"}
         try:
-            # Shorter timeout for chunk downloads to fail faster on stalls
             res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 30))
             res.raise_for_status()
-            
-            if res.status_code == 200:
-                raise Exception("Server ignored Range header, parallel download not supported.")
-                
             with open(output_path, "rb+") as f:
                 f.seek(current_start)
                 buffer = bytearray()
-                try:
-                    # 128KB chunks for better throughput, buffered to 1MB before disk write
-                    for chunk in res.iter_content(chunk_size=128 * 1024):
-                        if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-                            return
-                        if chunk:
-                            buffer.extend(chunk)
-                            # Buffer writes to 1MB to prevent disk stuttering
-                            if len(buffer) >= 1024 * 1024:
-                                f.write(buffer)
-                                progress_list[idx] += len(buffer)
-                                buffer.clear()
-                            if start + progress_list[idx] + len(buffer) > end:
-                                break
-                finally:
-                    if buffer:
-                        f.write(buffer)
-                        progress_list[idx] += len(buffer)
-                        buffer.clear()
-                        
-            if start + progress_list[idx] > end:
-                return # Success
-        except Exception as e:
-            logger.warning(f"Thread {idx} dropped connection (attempt {attempt+1}/{retries}): {e}")
-            time.sleep(2)
-            
-    raise Exception(f"Download thread {idx} permanently failed after {retries} retries.")
-    
-def extract_thumbnail(video_path, thumb_path):
-    """Extracts a frame at the 1-second mark to use as the Telegram video thumbnail."""
-    cmd = [
-        'ffmpeg', '-y', '-i', video_path,
-        '-ss', '00:00:01',
-        '-vframes', '1',
-        '-vf', 'scale=320:-1',
-        '-q:v', '2',
-        thumb_path
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-async def delayed_delete(filepath, delay=7200):
-    """Deletes a file after a specific delay (default 2 hours)."""
-    await asyncio.sleep(delay)
-    if os.path.exists(filepath):
-        try: os.remove(filepath)
-        except Exception: pass
-
-async def download_video_from_url(url, output_path, progress_viewer):
-    loop = asyncio.get_running_loop()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    
-    for attempt in range(3):
-        try:
-            # Reduced timeout to fail faster on unresponsive servers
-            res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 20))
-            res.raise_for_status()
-            break
-        except requests.exceptions.RequestException as e:
-            if attempt == 2:
-                raise ValueError(f"Download connection failed after 3 attempts: {e}")
-            logger.warning(f"Initial connection dropped (attempt {attempt+1}/3): {e}")
-            await asyncio.sleep(3)
-
-    content_type = res.headers.get('Content-Type', '')
-    if 'text/' in content_type.lower():
-        raise ValueError(f"URL returned text/webpage ({content_type}), not a direct video file.")
-        
-    total_size = int(res.headers.get('content-length', 0))
-    accept_ranges = res.headers.get('accept-ranges', '').lower() == 'bytes'
-    chat_id = progress_viewer.chat_id
-    
-    # If the server doesn't support chunked ranges, fallback to standard single-thread
-    if total_size == 0 or not accept_ranges:
-        def _single_download():
-            downloaded = 0
-            with open(output_path, 'wb') as f:
-                for chunk in res.iter_content(chunk_size=2*1024*1024):
-                    if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-                        raise Exception("User Cancelled")
+                for chunk in res.iter_content(chunk_size=128 * 1024):
+                    if task.cancel_flag.is_set(): return
                     if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        asyncio.run_coroutine_threadsafe(progress_viewer.update(downloaded, total_size), loop)
-            if os.path.getsize(output_path) < 100 * 1024:
-                raise ValueError("Downloaded file is invalid or too small.")
-        await asyncio.to_thread(_single_download)
-        return
+                        buffer.extend(chunk)
+                        if len(buffer) >= 1024 * 1024:
+                            f.write(buffer)
+                            progress_list[idx] += len(buffer)
+                            buffer.clear()
+                        if start + progress_list[idx] + len(buffer) > end: break
+                if buffer:
+                    f.write(buffer)
+                    progress_list[idx] += len(buffer)
+            if start + progress_list[idx] > end: return
+        except Exception:
+            time.sleep(2)
+    raise Exception(f"Download thread {idx} permanently failed.")
 
-    res.close()
+async def download_video_from_url(url: str, output_path: Path, task: Task, status: Message):
+    loop = asyncio.get_running_loop()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    res = await asyncio.to_thread(requests.get, url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 20))
+    total_size = int(res.headers.get('content-length', 0))
     
-    # 8-Part Parallel Download Implementation
-    with open(output_path, "wb") as f:
-        f.truncate(total_size) # Pre-allocate file on disk
-        
+    t0 = time.time(); last = [0.0]
+    async def update_ui(downloaded):
+        now = time.time()
+        if now - last[0] > REFRESH:
+            last[0] = now
+            await safe_edit(status, pb_bytes("Downloading", downloaded, total_size, t0), CANCEL_BTN)
+
+    with open(output_path, "wb") as f: f.truncate(total_size)
     num_threads = 8
     chunk_size = total_size // num_threads
     progress_list = [0] * num_threads
@@ -392,596 +647,747 @@ async def download_video_from_url(url, output_path, progress_viewer):
         for i in range(num_threads):
             start = i * chunk_size
             end = total_size - 1 if i == num_threads - 1 else (i + 1) * chunk_size - 1
-            futures.append(loop.run_in_executor(
-                executor, _download_range, url, start, end, output_path, progress_list, i, chat_id
-            ))
+            futures.append(loop.run_in_executor(executor, _download_range, url, start, end, output_path, progress_list, i, task))
         
         while True:
             downloaded = sum(progress_list)
-            if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-                raise Exception("User Cancelled")
-                
-            await progress_viewer.update(downloaded, total_size)
-            
-            if downloaded >= total_size or all(f.done() for f in futures):
-                break
+            if task.cancel_flag.is_set(): raise Exception("Cancelled")
+            await update_ui(downloaded)
+            if downloaded >= total_size or all(f.done() for f in futures): break
             await asyncio.sleep(1)
-            
         await asyncio.gather(*futures)
-        
-    if os.path.getsize(output_path) < 100 * 1024:
-        raise ValueError("Downloaded file is invalid or too small.")
 
-async def encode_video(input_file, output_file, quality_choice, chat_id=None, status_message=None):
-    """Runs FFmpeg in a separate thread to avoid blocking the bot."""
-    target_bitrate = get_target_bitrate(input_file, quality_choice)
-    total_duration = get_video_duration(input_file)
-        
-    # Map quality to fixed width, letting height auto-scale (-2)
-    qual = quality_choice.upper()
-    if '2K' in qual:
-        scale = '2560:-2'
-    elif '1080' in qual:
-        scale = '1920:-2'
-    elif '720' in qual:
-        scale = '1280:-2'
-    else:
-        scale = '1920:-2'
+async def tg_download(source_msg: Message, dest: Path, status: Message, task: Task) -> Path:
+    dest.mkdir(parents=True, exist_ok=True)
+    t0 = time.time(); last = [0.0]
+    fname = getattr(source_msg.video, "file_name", None) or getattr(source_msg.document, "file_name", None) or "video.mkv"
+    target = str(dest / fname)
 
-    print(f"\n[INFO] 🎬 Encoding to {quality_choice} (Target Bitrate: {target_bitrate//1000} kbps)...")
-    
-    # RTX 6000 hardware-accelerated NVENC settings for speed and quality
-    cmd_nvenc = [
-        'ffmpeg', '-y', '-loglevel', 'error', '-stats', '-i', input_file,
-        '-map', '0:v:0',           # Maps ONLY the main video stream (avoids broken thumbnails)
-        '-map', '0:a?',            # Maps all audio streams
-        '-map', '0:s?',            # Maps all subtitle streams
-        '-vf', f'scale={scale},format=yuv420p', # Ensure 8-bit YUV420p to fix NVENC invalid param 8
-        '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq',
-        '-b:v', str(target_bitrate),
-        '-c:a', 'copy',            # Copies all audio streams without re-encoding
-        '-c:s', 'copy',            # Copies all subtitle streams without re-encoding
-        output_file
-    ]
-    
+    async def _prog(cur, tot):
+        if task.cancel_flag.is_set(): app.stop_transmission()
+        now = time.time()
+        if now - last[0] > REFRESH:
+            last[0] = now
+            await safe_edit(status, pb_bytes("Downloading", cur, tot, t0), CANCEL_BTN)
+
+    path = await source_msg.download(file_name=target, progress=_prog)
+    return Path(path)
+
+async def _download_video(c, m: Message, task: Task, status: Message) -> Optional[Path]:
+    parts = (m.text or "").split(maxsplit=1)
+    url_arg = parts[1].strip() if len(parts) > 1 else ""
+    url_m = re.search(r"(https?://\S+)", url_arg)
+
+    if url_m:
+        url = url_m.group(1)
+        dest = task.work_dir / f"{task.task_id}_dl.mkv"
+        await safe_edit(status, "📥 Downloading URL...", CANCEL_BTN)
+        async with dl_semaphore:
+            try:
+                # Attempt 8-part parallel first
+                await download_video_from_url(url, dest, task, status)
+                return dest
+            except Exception:
+                # Fallback to yt-dlp if it's a platform stream rather than direct file
+                return Path(await asyncio.to_thread(dl_ytdlp, url, task.chat_id, m.id, status))
+
+    if m.reply_to_message and (m.reply_to_message.video or m.reply_to_message.document):
+        await safe_edit(status, "📥 Downloading from Telegram...", CANCEL_BTN)
+        async with dl_semaphore:
+            return await tg_download(m.reply_to_message, task.work_dir, status, task)
+
+    task.stage = Stage.AWAIT_SRC
+    await safe_edit(status, "📨 **Send the video file** or paste a URL to get started.", CANCEL_BTN)
     try:
-        env = os.environ.copy()
-        # Use asyncio subprocess so we can gracefully terminate FFmpeg if cancelled
-        process = await asyncio.create_subprocess_exec(
-            *cmd_nvenc,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        if chat_id and chat_id in active_jobs:
-            if 'processes' not in active_jobs[chat_id]:
-                active_jobs[chat_id]['processes'] = []
-            active_jobs[chat_id]['processes'].append(process)
-            
-        viewer = EncodingProgressViewer(status_message, chat_id) if status_message else None
-        
+        result = await asyncio.wait_for(task.src_future, timeout=300)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        return None
+    if task.cancel_flag.is_set(): return None
+
+    src_type, src_data = result
+    await safe_edit(status, "📥 Downloading...", CANCEL_BTN)
+    async with dl_semaphore:
+        if src_type == "url":
+            dest = task.work_dir / f"{task.task_id}_dl.mkv"
+            try:
+                await download_video_from_url(src_data, dest, task, status)
+                return dest
+            except Exception:
+                return Path(await asyncio.to_thread(dl_ytdlp, src_data, task.chat_id, m.id, status))
+        else:
+            return await tg_download(src_data, task.work_dir, status, task)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MEDIA PROBE
+# ══════════════════════════════════════════════════════════════════════════════
+async def probe_media(path: Path) -> dict:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    return json.loads(out)
+
+async def extract_meta(task: Task):
+    info = await probe_media(task.input_path)
+    fmt  = info.get("format", {})
+    task.duration_s  = float(fmt.get("duration", 0))
+    task.src_bitrate = int(fmt.get("bit_rate", 0))
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            task.src_width  = s.get("width", 0)
+            task.src_height = s.get("height", 0)
+            if not task.src_bitrate: task.src_bitrate = int(s.get("bit_rate", 4_000_000))
+            break
+
+async def _find_main_audio(path: Path) -> str:
+    info = await probe_media(path)
+    streams = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    if not streams: return "a:0"
+    def _dur(s):
+        d = s.get("duration") or s.get("tags", {}).get("DURATION", "0")
+        try:
+            if ":" in str(d):
+                h, mm, sc = str(d).split(":")
+                return float(h) * 3600 + float(mm) * 60 + float(sc)
+            return float(d)
+        except: return 0.0
+    streams.sort(key=_dur, reverse=True)
+    return str(streams[0]["index"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MUX
+# ══════════════════════════════════════════════════════════════════════════════
+async def mux_video(task: Task, sub_path: Path, out_path: Path) -> Path:
+    audio_idx = await _find_main_audio(task.input_path)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(task.input_path), "-i", str(sub_path),
+        "-map", "0:v:0", "-map", f"0:{audio_idx}", "-map", "1:0",
+        "-c", "copy",
+        "-metadata:s:s:0", "title=ENGLISH @TheFrictionRealm",
+        "-metadata:s:s:0", "language=eng", "-disposition:s:0", "default",
+        "-metadata", f"title={task.output_name}",
+        str(out_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Mux failed:\n{err.decode(errors='replace')[:600]}")
+    return out_path
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENCODE  (Optimized for RTX A6000 NVENC)
+# ══════════════════════════════════════════════════════════════════════════════
+def out_filename(base: str, quality: str) -> str:
+    return f"{base} [{quality}][{UPLOAD_TAG}].mkv"
+
+def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec, output_name: str, src_bitrate: int) -> list:
+    scale_factors = {"2K": 0.75, "1080p": 0.50, "720p": 0.25}
+    target_bitrate = max(int(src_bitrate * scale_factors.get(spec.label, 0.50)), 500_000)
+
+    return [
+        "ffmpeg", "-y", "-loglevel", "error", "-stats",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-i", str(input_path),
+        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+        "-vf", f"scale_cuda={spec.width}:-2:interp_algo=lanczos:format=nv12",
+        "-c:v", "hevc_nvenc", "-preset", "p4", "-tune", "hq",
+        "-b:v", str(target_bitrate),
+        "-c:a", "copy", "-c:s", "copy",
+        "-metadata", f"title={output_name}",
+        str(out_path)
+    ]
+
+async def run_encode(task: Task, spec: QualitySpec, out_path: Path, prog_msg: Message):
+    cancel = task.quality_cancel_flags[spec.label]
+    
+    # Allows 3 parallel hardware renders on the RTX A6000
+    async with mux_semaphore:
+        if cancel.is_set() or task.cancel_flag.is_set(): return
+
+        cmd = build_encode_cmd(task.input_path, out_path, spec, task.output_name, task.src_bitrate)
+        log.info(f"[{spec.label}] RTX A6000 NVENC Encode start")
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        task.quality_procs[spec.label] = proc
+
+        last_edit, t0 = 0.0, time.time()
         time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
         fps_pattern = re.compile(r"fps=\s*([\d\.]+)")
         speed_pattern = re.compile(r"speed=\s*([\d\.x]+)")
         
-        stderr_buffer = []
+        stderr_lines = []
         while True:
+            if cancel.is_set() or task.cancel_flag.is_set():
+                proc.terminate(); break
             try:
-                # FFmpeg separates progress updates with \r instead of \n
-                line = await process.stderr.readuntil(b'\r')
+                line = await proc.stderr.readuntil(b'\r')
             except asyncio.exceptions.IncompleteReadError as e:
                 line = e.partial
-                
-            if not line:
-                break
-                
+
+            if not line: break
+            
             line_str = line.decode('utf-8', errors='ignore').strip()
-            if not line_str:
-                continue
-                
-            stderr_buffer.append(line_str)
-            if len(stderr_buffer) > 10:
-                stderr_buffer.pop(0)
-                
-            if viewer:
+            if not line_str: continue
+            
+            stderr_lines.append(line_str)
+            if len(stderr_lines) > 20: stderr_lines.pop(0)
+
+            if time.time() - last_edit > REFRESH:
                 time_match = time_pattern.search(line_str)
                 if time_match:
                     h, m, s = time_match.groups()
-                    current_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                    cur_s = int(h) * 3600 + int(m) * 60 + float(s)
+                    pct = min(cur_s / (task.duration_s or 1) * 100, 100)
+                    
                     fps_match = fps_pattern.search(line_str)
-                    fps = fps_match.group(1) if fps_match else "0"
-                    speed_match = speed_pattern.search(line_str)
-                    speed = speed_match.group(1) if speed_match else "0x"
+                    fps = float(fps_match.group(1)) if fps_match else 0.0
                     
+                    spd_match = speed_pattern.search(line_str)
+                    spd = spd_match.group(1) if spd_match else "0x"
+                    
+                    eta = (task.duration_s - cur_s) / (cur_s / (time.time() - t0)) if cur_s > 0 else 0
+                    
+                    txt = pb_enc(spec.label, task.output_name, pct, cur_s, task.duration_s, fps, spd, eta, time.time() - t0)
                     try:
-                        await viewer.update(current_sec, total_duration, fps, speed)
-                    except Exception as e:
-                        if "User Cancelled" in str(e):
-                            process.terminate()
-                            raise
+                        await prog_msg.edit(txt, reply_markup=qual_cancel_kb(task.task_id, spec.label))
+                        last_edit = time.time()
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except: pass
+
+        await proc.wait()
+        task.quality_procs.pop(spec.label, None)
+
+        if not (cancel.is_set() or task.cancel_flag.is_set()) and proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg error:\n{chr(10).join(stderr_lines[-10:])}")
+
+# ── UPLOAD ────────────────────────────────────────────────────────────────────
+def build_caption(task: Task, quality: str) -> str:
+    title = task.output_name or task.series_name or task.raw_name
+    return f"<b>{title}</b>\n\n<blockquote>Episode : {task.episode_tag or title}\nQuality : {quality}\nSubtitles : INBUILT</blockquote>"
+
+def build_mux_caption(task: Task) -> str:
+    title = task.raw_name or task.output_name or task.series_name
+    return f"<b>{title}</b>\n\n<blockquote>Episode : {task.raw_name or title}\nSubtitles : ENGLISH @TheFrictionRealm</blockquote>"
+
+async def upload_file(chat_id: int, path: Path, caption: str, thumb: Optional[Path], prog_msg: Message, label: str, name: str):
+    file_size = os.path.getsize(path)
+    TELEGRAM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+    if file_size >= TELEGRAM_LIMIT_BYTES:
+        start_http_server()
+        file_id = uuid.uuid4().hex
+        file_id_map[file_id] = str(path)
+        download_path = f"/download/{file_id}"
+        public_url = os.getenv("LIGHTNING_APP_STATE_URL", os.getenv("LIGHTNING_HOST", "http://localhost"))
+        if not public_url.startswith("http"): public_url = "https://" + public_url
+        public_url = public_url.rstrip('/').replace('7860', str(HTTP_PORT))
+        download_link = f"{public_url}{download_path}"
         
-        await process.wait()
-        
-        if chat_id and active_jobs.get(chat_id, {}).get('cancel'):
-            raise Exception("User Cancelled")
-            
-        if process.returncode != 0:
-            error_msg = "\n".join(stderr_buffer)
-            raise Exception(f"FFmpeg failed:\n{error_msg}")
-            
-        print("⚡ Encoding via RTX 6000 NVENC completed successfully!")
-    except Exception as e:
-        if "User Cancelled" not in str(e):
-            print(f"⚠️ GPU Encoding Failed: {e}")
-        raise
-
-# ==========================================
-# 6. Auto-Shutdown to Save Credits
-# ==========================================
-
-def deactivate_machine():
-    """Immediately shuts down the Lightning AI environment to save GPU credits."""
-    print("\n🛑 OPERATION COMPLETE. INITIATING IMMEDIATE SHUTDOWN TO SAVE RTX 6000 CREDITS! 🛑")
-    time.sleep(2)
-    try:
-        # This command powers down the Linux VM running the studio
-        subprocess.run(["sudo", "shutdown", "-h", "now"], check=True)
-    except Exception as e:
-        print(f"Could not automatically shut down. Please stop manually. Error: {e}")
-
-# ==========================================
-# Bot Conversation Logic
-# ==========================================
-
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not all([API_ID, API_HASH, BOT_TOKEN]):
-    print("❌ ERROR: You must set API_ID, API_HASH, and BOT_TOKEN environment variables!")
-    sys.exit(1)
-
-app = Client(
-    "encoding_bot", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
-    bot_token=BOT_TOKEN,
-    max_concurrent_transmissions=8  # Safe optimized limit for Telegram
-)
-
-# Memory storage for the conversation state
-user_sessions = {}
-active_jobs = {}
-os.makedirs("downloads", exist_ok=True)
-
-# --- Pipeline Concurrency Controls ---
-# Semaphores to allow processing different files at different stages concurrently
-dl_semaphore = asyncio.Semaphore(4)  # Max concurrent downloads (increased for faster processing)
-mux_semaphore = asyncio.Semaphore(3) # Max concurrent GPU encodes (allows 3 parallel)
-ul_semaphore = asyncio.Semaphore(6)  # Max concurrent uploads (increased for faster processing)
-
-def is_allowed(user_id):
-    if not user_id:
-        return False
-    allowed_user = os.getenv("ALLOWED_USER_ID")
-    if allowed_user:
-        # Support multiple users separated by commas (e.g., "12345, 67890")
-        allowed_users = [u.strip().strip('"').strip("'") for u in allowed_user.split(',')]
-        if str(user_id).strip() not in allowed_users:
-            return False
-    return True
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    if not is_allowed(message.from_user.id):
-        await message.reply_text("❌ Access Denied: You are not authorized to use this bot.")
-        return
-        
-    await message.reply_text(
-        "Welcome! I am a video encoding bot.\n"
-        "Reply to any video message with `/encode`, OR send `/encode <url>` to start a new job.\n"
-        "To reuse a cached video, send `/log <video_id>`.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-@app.on_message(filters.command("shutdown") & filters.private)
-async def shutdown_cmd(client, message):
-    if not is_allowed(message.from_user.id):
-        return
-    await message.reply_text("🛑 Shutting down Lightning AI server...")
-    deactivate_machine()
-
-@app.on_message(filters.command("encode") & filters.private)
-async def encode_command(client, message):
-    if not is_allowed(message.from_user.id):
-        await message.reply_text("❌ Access Denied.")
+        await prog_msg.edit(f"🔗 **{label} version is ready!**\n\nFile is {file_size / (1024**3):.2f} GB, too large for Telegram. Direct Link:\n`{download_link}`\n\n_(Make sure port {HTTP_PORT} is exposed)_")
         return
 
-    # Check if a URL was provided
-    if len(message.command) > 1:
-        url = message.text.split(maxsplit=1)[1]
-        if url.startswith("http"):
-            original_name = url.split("/")[-1].split("?")[0]
-            if not original_name or "." not in original_name:
-                original_name = "video.mkv"
-                
-            user_sessions[message.chat.id] = {
-                'source_type': 'url',
-                'url': url,
-                'original_name': original_name,
-                'message_to_reply': message.id,
-                'awaiting_name': True
-            }
-        else:
-            await message.reply_text("⚠️ Please provide a valid HTTP/HTTPS URL.")
-            return
-    else:
-        # Check if it's a reply
-        reply = message.reply_to_message
-        if not reply or not (reply.video or reply.document):
-            await message.reply_text("⚠️ Please reply directly to a video message with /encode, OR send /encode <url>.")
-            return
-            
-        media = reply.video or reply.document
-        file_id = media.file_id
-        original_name = getattr(media, 'file_name', 'video.mkv') or 'video.mkv'
+    t0 = time.time(); last = [0.0]; last_txt = [""]
 
-        user_sessions[message.chat.id] = {
-            'source_type': 'telegram',
-            'file_id': file_id,
-            'original_name': original_name,
-            'message_to_reply': reply.id,
-            'awaiting_name': True
-        }
-    
-    await message.reply_text(
-        f"✨ Found video: `{original_name}`\nPlease reply with the desired output filename (or type `/skip` to use the original name):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    
-@app.on_message(filters.command("log") & filters.private)
-async def log_command(client, message):
-    if not is_allowed(message.from_user.id):
-        return
-    if len(message.command) < 2:
-        await message.reply_text("⚠️ Usage: `/log <video_id>`")
-        return
-        
-    vid_id = message.command[1]
-    local_path = f"downloads/{vid_id}.mkv"
-    if not os.path.exists(local_path):
-        await message.reply_text("❌ Video not found on server. It may have expired and been deleted.")
-        return
-        
-    user_sessions[message.chat.id] = {
-        'source_type': 'local',
-        'vid_id': vid_id,
-        'original_name': f"video_{vid_id}.mkv",
-        'message_to_reply': message.id,
-        'awaiting_name': True
-    }
-    await message.reply_text("📁 Video found in server cache!\nPlease reply with the desired output filename (or type `/skip` to use default):")
-
-@app.on_message((filters.text | filters.photo | filters.document | filters.video) & filters.private & ~filters.command(["start", "encode", "log", "shutdown"]))
-async def meta_handler(client, message):
-    chat_id = message.chat.id
-    if chat_id not in user_sessions:
-        return
-        
-    session = user_sessions[chat_id]
-    
-    # Prevent spam if the user forwards an album (multiple photos/videos at once)
-    if message.media_group_id:
-        if session.get('last_media_group_id') == message.media_group_id:
-            return
-        session['last_media_group_id'] = message.media_group_id
-
-    # Ignore Userbot/PM-guard auto-replies that break the bot's conversation flow
-    text_content = message.text or message.caption
-    if text_content and any(phrase in text_content.lower() for phrase in ["access denied", "access blocked", "⛔"]):
-        return
-
-    now = time.time()
-
-    if session.get('awaiting_name'):
-        if not message.text:
-            # Debounce: Only send the error message if we haven't sent one in the last 2 seconds
-            if now - session.get('last_error_time', 0) > 2:
-                await message.reply_text("⚠️ I'm waiting for a filename as text. Please reply with the desired output filename, or type `/cancel` to abort.")
-                session['last_error_time'] = now
-            return
-
-        if message.text.strip().lower() != '/skip':
-            new_name = message.text.strip()
-            if not "." in new_name:
-                new_name += ".mkv"
-            session['original_name'] = new_name
-
-        session['awaiting_name'] = False
-        session['awaiting_thumbnail'] = True
-        await message.reply_text("🖼️ Please send a custom thumbnail photo (or type `/skip` to auto-extract one):")
-        return
-        
-    elif session.get('awaiting_thumbnail'):
-        if message.text and message.text.strip().lower() == '/cancel':
-            del user_sessions[chat_id]
-            await message.reply_text("❌ Operation cancelled.")
-            return
-
-        if message.photo:
-            session['custom_thumb'] = message.photo.file_id
-        elif message.text and message.text.strip().lower() == '/skip':
-            session['custom_thumb'] = None
-        else:
-            if now - session.get('last_error_time', 0) > 2:
-                await message.reply_text("⚠️ Please send a compressed PHOTO (not a file/document), or type `/cancel` to abort.")
-                session['last_error_time'] = now
-            return
-
-        session['awaiting_thumbnail'] = False
-        
-        source_map = {
-            'url': 'URL Link',
-            'local': f"Cached Video (`{session.get('vid_id')}`)",
-            'telegram': 'Telegram Message'
-        }
-        source_text = source_map.get(session['source_type'], 'Unknown')
-        
-        # Pre-calculate to show the user exactly what the final names will be
-        name_2k = process_metadata(session['original_name'], "2K")
-        name_1080 = process_metadata(session['original_name'], "1080P")
-        name_720 = process_metadata(session['original_name'], "720P")
-
-        summary = (
-            f"Okay, here is the plan:\n\n"
-            f"🔹 **Source:** `{source_text}`\n"
-            f"🔹 **Base Filename:** `{session['original_name']}`\n\n"
-            f"🔹 **Output Files:**\n"
-            f"  `{name_2k}`\n"
-            f"  `{name_1080}`\n"
-            f"  `{name_720}`\n"
-            f"This will generate three separate video files. Do you want to begin the process?"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Yes, Start", callback_data="start_yes"),
-                InlineKeyboardButton("Cancel", callback_data="start_cancel"),
-            ]
-        ])
-        await message.reply_text(summary, reply_markup=keyboard)
-        return
-
-@app.on_callback_query(filters.regex(r"^start_"))
-async def start_callback(client, callback_query):
-    chat_id = callback_query.message.chat.id
-    if chat_id not in user_sessions:
-        await callback_query.answer("Session expired.", show_alert=True)
-        return
-
-    action = callback_query.data.split("_")[1]
-    if action == "cancel":
-        await callback_query.edit_message_text("❌ Job cancelled.")
-        del user_sessions[chat_id]
-        return
-
-    session = user_sessions.pop(chat_id)
-    status_message = await callback_query.edit_message_text("⏳ Queuing job...")
-    
-    # Register active job
-    active_jobs[chat_id] = {'cancel': False, 'processes': []}
-    download_complete = False
-    
-    local_input = None
-    thumb_path = None
-    encoded_files_to_cleanup = []
-    files_to_keep = [] # For files > 2GB that will be served via HTTP
-    
-    try:
-        vid_id = session.get('vid_id', uuid.uuid4().hex[:8])
-        local_input = f"downloads/{vid_id}.mkv"
-        thumb_path = f"downloads/thumb_{vid_id}.jpg"
-        
-        # --- 1. Download ---
-        if session['source_type'] != 'local':
-            await status_message.edit_text("⏳ Waiting for a download slot in the pipeline...")
-            async with dl_semaphore:
-                if active_jobs.get(chat_id, {}).get('cancel'):
-                    raise Exception("User Cancelled")
-                
-                await status_message.edit_text("🚀 Starting download...")
-                dl_viewer = PyrogramProgressViewer(status_message, "Downloading", chat_id)
-                if session['source_type'] == 'url':
-                    await download_video_from_url(session['url'], local_input, dl_viewer)
-                else:
-                    async def dl_progress(current, total):
-                        await dl_viewer.update(current, total)
-                    await client.download_media(session['file_id'], file_name=local_input, progress=dl_progress)
-                
-                asyncio.create_task(delayed_delete(local_input, 7200)) # 2 Hour expiry timer
-                await client.send_message(chat_id, f"✅ Download complete!\n\n💾 **Video ID:** `{vid_id}`\n\nThis video is cached on the server for 2 hours. To encode it again into a different quality without re-downloading, use:\n`/log {vid_id}`")
-        else:
-            await status_message.edit_text("✅ Local cache ready!")
-            
-        download_complete = True
-
-        # --- Thumbnail ---
-        if session.get('custom_thumb'):
-            await status_message.edit_text("✅ Download Complete! Downloading custom thumbnail...")
-            await client.download_media(session['custom_thumb'], file_name=thumb_path)
-        else:
-            await status_message.edit_text("✅ Download Complete! Extracting thumbnail...")
-            extract_thumbnail(local_input, thumb_path)
-
-        # Determine qualities to encode
-        qualities_to_encode = [
-            ("2K", process_metadata(session['original_name'], "2K")),
-            ("1080P", process_metadata(session['original_name'], "1080P")),
-            ("720P", process_metadata(session['original_name'], "720P")),
-        ]
-
-        async def process_quality(quality, final_output_name):
-            q_status = await client.send_message(chat_id, f"⏳ Queuing {quality} version...")
-            try:
-                # --- 2. Encode ---
-                await q_status.edit_text(f"⏳ Waiting for GPU to encode {quality} version...")
-                async with mux_semaphore:
-                    if active_jobs.get(chat_id, {}).get('cancel'):
-                        raise Exception("User Cancelled")
-                    await q_status.edit_text(f"🎬 Encoding {quality} version...")
-                    await encode_video(local_input, final_output_name, quality, chat_id, q_status)
-                
-                # --- 3. Upload or Link ---
-                file_size = os.path.getsize(final_output_name)
-                TELEGRAM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-
-                if file_size >= TELEGRAM_LIMIT_BYTES:
-                    await q_status.edit_text(f"✅ {quality} encoded. File is {file_size / (1024**3):.2f} GB, too large for Telegram. Generating download link...")
-                    start_http_server()
-                    files_to_keep.append(final_output_name)
-                    
-                    # Generate a unique ID for this file and map it
-                    file_id = uuid.uuid4().hex
-                    file_id_map[file_id] = final_output_name
-                    download_path = f"/download/{file_id}"
-                    
-                    public_url = os.getenv("LIGHTNING_APP_STATE_URL") or os.getenv("LIGHTNING_HOST")
-
-                    if public_url:
-                        if not public_url.startswith("http"):
-                            public_url = "https://" + public_url
-                        public_url = public_url.rstrip('/')
-                        
-                        # Best guess for the URL, replacing the default app port with our HTTP port
-                        download_link = f"{public_url.replace('7860', str(HTTP_PORT))}{download_path}"
-                        await client.send_message(
-                            chat_id,
-                            (
-                                f"🔗 **{quality} version is ready!**\n\n"
-                                f"File is too large for Telegram. Use this direct download link:\n`{download_link}`\n\n"
-                                f"**Note:** You must expose port `{HTTP_PORT}` in the Lightning AI UI for this link to work. The port in the URL may need to be adjusted manually if it's incorrect."
-                            ),
-                            reply_to_message_id=session['message_to_reply']
-                        )
-                    else:
-                        # This is the case you likely hit, where no public URL env var is set.
-                        file_name_for_display = os.path.basename(final_output_name)
-                        await client.send_message(
-                            chat_id,
-                            f"✅ **{quality} version is ready!**\n\n"
-                            f"File is too large for Telegram. It has been saved on the server as `{file_name_for_display}`.\n\n"
-                            f"To download, please use the Lightning AI UI to expose port `{HTTP_PORT}` and then access the following path on your public URL:\n"
-                            f"`{download_path}`\n\n"
-                            f"Example: `http://<your-public-url-for-port-{HTTP_PORT}>{download_path}`",
-                            reply_to_message_id=session['message_to_reply']
-                        )
-                else:
-                    await q_status.edit_text(f"⏳ Waiting to upload {quality} version...")
-                    async with ul_semaphore:
-                        if active_jobs.get(chat_id, {}).get('cancel'):
-                            raise Exception("User Cancelled")
-                        await q_status.edit_text(f"🚀 Uploading {quality} version...")
-                        ul_viewer = PyrogramProgressViewer(q_status, f"Uploading {quality}", chat_id)
-                        
-                        async def ul_progress(current, total):
-                            await ul_viewer.update(current, total)
-                            
-                        await client.send_document(
-                            chat_id, 
-                            document=final_output_name, 
-                            thumb=thumb_path if os.path.exists(thumb_path) else None,
-                            reply_to_message_id=session['message_to_reply'],
-                            progress=ul_progress
-                        )
-
-                # Clean up the individual progress message once done
-                try:
-                    await q_status.delete()
-                except Exception:
-                    pass
-            except Exception as e:
-                if "User Cancelled" in str(e):
-                    await q_status.edit_text(f"❌ {quality} cancelled.")
-                else:
-                    await q_status.edit_text(f"❌ {quality} failed: {e}")
-                raise e
-
-        await status_message.edit_text("🚀 Starting parallel encoding tasks...")
-        tasks = []
-        for quality, final_output_name in qualities_to_encode:
-            encoded_files_to_cleanup.append(final_output_name)
-            tasks.append(process_quality(quality, final_output_name))
-            
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            failed_tasks = [res for res in results if isinstance(res, Exception)]
-            if failed_tasks:
-                # Combine error messages from all failed tasks for a clear report
-                error_summary = "\n".join([f"- {type(e).__name__}: {e}" for e in failed_tasks])
-                raise Exception(f"One or more encoding tasks failed:\n{error_summary}")
-        
-        # Clean up the chat by deleting the prompt/progress message!
+    async def _prog(cur, tot):
+        now = time.time()
+        if now - last[0] < REFRESH: return
+        txt = pb_up(label, name, cur, tot, t0)
+        if txt == last_txt[0]: return
         try:
-            await status_message.delete()
-        except Exception:
-            pass
-        
-        # Ask the user if they want to shut down or keep going
-        power_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🛑 Shut Down Server", callback_data="power_off"),
-                InlineKeyboardButton("✅ Keep Alive (Reuse Video)", callback_data="power_on")
-            ]
-        ])
-        await client.send_message(chat_id, "🎉 Job complete! Do you want to shut down the Lightning AI server now to save credits?", reply_markup=power_keyboard)
-        
+            await prog_msg.edit(txt)
+            last[0] = now; last_txt[0] = txt
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except: pass
+
+    async with ul_semaphore:
+        await app.send_document(
+            chat_id=chat_id, document=str(path),
+            caption=caption, parse_mode=ParseMode.HTML,
+            thumb=str(thumb) if thumb else None, progress=_prog,
+        )
+
+# ── PER-QUALITY WORKER (encode → upload) ─────────────────────────────────────
+async def quality_worker(task: Task, spec: QualitySpec, trigger_msg: Message, target_chat: int):
+    label  = spec.label
+    cancel = task.quality_cancel_flags[label]
+    out    = task.work_dir / out_filename(task.output_name, label)
+    task.encoded_files[label] = out
+
+    prog_msg = await trigger_msg.reply(
+        pb_enc(label, task.output_name, 0, 0, task.duration_s, 0, "0x", task.duration_s, 0),
+        reply_markup=qual_cancel_kb(task.task_id, label),
+    )
+    task.quality_msgs[label] = prog_msg
+
+    err_str = None
+    try:    await run_encode(task, spec, out, prog_msg)
+    except RuntimeError as e: err_str = str(e)
+
+    if cancel.is_set() or task.cancel_flag.is_set():
+        try: await prog_msg.edit(f"🚫 **[{label}]** Cancelled", reply_markup=None)
+        except: pass
+        task.encode_done_flags[label].set(); return
+
+    if err_str:
+        log.error(f"[{label}] encode error: {err_str[:200]}")
+        try: await prog_msg.edit(f"❌ **[{label}]** Encode failed:\n```\n{err_str[:2000]}\n
+```", reply_markup=None)
+        except: pass
+        task.encode_done_flags[label].set(); return
+
+    task.encode_done_flags[label].set()
+    try: await prog_msg.edit(f"✅ **[{label}]** Encoded! Uploading…", reply_markup=None)
+    except: pass
+
+    try:
+        caption = build_caption(task, label)
+        await upload_file(target_chat, out, caption, task.thumb_path, prog_msg, label, task.output_name)
+        try: await prog_msg.edit(f"✅ **[{label}]** Upload complete! 🎉")
+        except: pass
     except Exception as e:
-        if "User Cancelled" in str(e):
-            await status_message.edit_text("❌ Job was cancelled by the user.")
+        log.exception(f"[{label}] upload failed")
+        try: await prog_msg.edit(f"❌ **[{label}]** Upload failed: `{e}`")
+        except: pass
+
+async def encode_all(task: Task, trigger_msg: Message, target_chat: int):
+    for spec in QUALITY_SPECS:
+        task.quality_cancel_flags[spec.label] = asyncio.Event()
+        task.encode_done_flags[spec.label]    = asyncio.Event()
+    await asyncio.gather(*[
+        asyncio.create_task(quality_worker(task, spec, trigger_msg, target_chat))
+        for spec in QUALITY_SPECS
+    ])
+
+# ── CANCEL HELPER ─────────────────────────────────────────────────────────────
+async def do_cancel(task: Task, msg: Message, reason: str = "User requested cancellation."):
+    task.stage = Stage.CANCELLED
+    task.cancel_flag.set()
+    for f in task.quality_cancel_flags.values(): f.set()
+    for proc in list(task.quality_procs.values()):
+        try: proc.kill()
+        except: pass
+    _cancel_all_futures(task)
+    cleanup_task(task)
+    await msg.reply(f"🚫 **Cancelled:** {reason}")
+
+# ── NAME PARSER ───────────────────────────────────────────────────────────────
+def parse_name(raw: str, task: Task):
+    task.raw_name = raw.strip()
+    cleaned = re.sub(r"\s*\[.*?\]", "", task.raw_name)
+    cleaned = os.path.splitext(cleaned)[0].strip()
+    task.output_name = cleaned
+    task.series_name = cleaned
+    ep_m = re.search(r"\bEP?(\d+)\b", cleaned, re.IGNORECASE)
+    task.episode_tag = f"EP{ep_m.group(1)}" if ep_m else cleaned
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BOT COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("start"))
+async def cmd_start(c, m: Message):
+    await m.reply_text(
+        "🎬 **TheFrictionRealm — RTX A6000 Pipeline**\n\n"
+        "**OCR Pipeline:**\n"
+        "  `/ocr` — Download → OCR → Translate → Mux → Upload + Encode\n\n"
+        "**Direct Encode:**\n"
+        "  `/enc` — Download → Encode all qualities → Upload\n\n"
+        "**Controls:**\n"
+        "  `/cancel` — Cancel any active interactive setup task\n"
+        "  `/status` — Show running tasks\n"
+        "  `/shutdown` — Power off Lightning AI server\n\n"
+        "_Reply to a video or include a URL with the command._"
+    )
+
+# ── /ocr ──────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("ocr"))
+async def cmd_ocr(c, m: Message):
+    chat_id = m.chat.id
+    existing = active_tasks.get(chat_id)
+    
+    # Only block if we are in an interactive prompt phase. Background tasks are ignored!
+    blocking_stages = (Stage.AWAIT_SRC, Stage.AWAIT_CUT, Stage.AWAIT_SUB, Stage.AWAIT_NAME, Stage.AWAIT_THUMB)
+    if existing and existing.stage in blocking_stages:
+        return await m.reply("⚠️ You are currently setting up another video. Finish the setup or use /cancel first.")
+        
+    task = new_task(Mode.OCR, chat_id, m.from_user.id)
+    active_tasks[chat_id] = task
+    asyncio.create_task(_run_ocr(c, m, task))
+
+# ── /enc ──────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("enc"))
+async def cmd_enc(c, m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.reply("⛔ Unauthorized.")
+        
+    chat_id  = m.chat.id
+    existing = active_tasks.get(chat_id)
+    
+    blocking_stages = (Stage.AWAIT_SRC, Stage.AWAIT_NAME, Stage.AWAIT_THUMB, Stage.CONFIRMING)
+    if existing and existing.stage in blocking_stages:
+        return await m.reply("⚠️ You are currently setting up another video. Finish the setup or use /cancel first.")
+        
+    task = new_task(Mode.ENC, chat_id, m.from_user.id)
+    active_tasks[chat_id] = task
+    asyncio.create_task(_run_enc(c, m, task))
+
+# ── /cancel ───────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("cancel"))
+async def cmd_cancel(c, m: Message):
+    task = active_tasks.get(m.chat.id)
+    blocking_stages = (Stage.AWAIT_SRC, Stage.AWAIT_CUT, Stage.AWAIT_SUB, Stage.AWAIT_NAME, Stage.AWAIT_THUMB, Stage.CONFIRMING)
+    if not task or task.stage not in blocking_stages:
+        return await m.reply("✅ No active interactive task to cancel. (Use inline buttons to cancel background jobs).")
+    await do_cancel(task, m)
+
+# ── /status ───────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("status"))
+async def cmd_status(c, m: Message):
+    if not is_admin(m.from_user.id): return await m.reply("⛔ Unauthorized.")
+    live = [t for t in active_tasks.values() if t.stage not in (Stage.DONE, Stage.CANCELLED)]
+    if not live: return await m.reply("✅ No active tasks.")
+    lines = ["📊 **Active Tasks:**\n"]
+    for t in live:
+        lines.append(
+            f"• `{t.task_id}` [{t.mode.value.upper()}] — **{t.output_name or 'setup…'}**\n"
+            f"  Stage: `{t.stage.name}` | Elapsed: `{fmt_time(time.time() - t.started_at)}`"
+        )
+    await m.reply("\n".join(lines))
+
+# ── /shutdown ─────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("shutdown"))
+async def cmd_shutdown(c, m: Message):
+    if not is_admin(m.from_user.id): return await m.reply("⛔ Unauthorized.")
+    await m.reply("🛑 Shutting down Lightning AI server to save RTX A6000 credits. Goodbye!")
+    await asyncio.sleep(1)
+    try: subprocess.run(["sudo", "shutdown", "-h", "now"], check=False)
+    except: pass
+    os._exit(0)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UNIVERSAL MESSAGE ROUTER
+# ══════════════════════════════════════════════════════════════════════════════
+@app.on_message(~filters.command(["ocr", "enc", "cancel", "start", "status", "shutdown"]))
+async def msg_router(c, m: Message):
+    task = active_tasks.get(m.chat.id)
+    if not task or task.stage in (Stage.DONE, Stage.CANCELLED): return
+
+    s = task.stage
+
+    if s == Stage.AWAIT_SRC:
+        if m.video or (m.document and m.document.mime_type and "video" in m.document.mime_type):
+            if not task.src_future.done(): task.src_future.set_result(("tg", m))
+        elif m.text:
+            url_m = re.search(r"(https?://\S+)", m.text)
+            if url_m and not task.src_future.done(): task.src_future.set_result(("url", url_m.group(1)))
+
+    elif s == Stage.AWAIT_CUT and m.text:
+        if not task.cut_future.done(): task.cut_future.set_result(m.text.strip())
+
+    elif s == Stage.AWAIT_SUB:
+        if m.document:
+            fname = m.document.file_name or ""
+            if fname.lower().endswith((".srt", ".ass", ".ssa", ".vtt")):
+                if not task.subtitle_future.done(): task.subtitle_future.set_result(m)
+            else:
+                await m.reply("⚠️ Please send a subtitle file: `.srt`, `.ass`, `.ssa`, or `.vtt`")
+
+    elif s == Stage.AWAIT_NAME and m.text:
+        if not task.name_future.done(): task.name_future.set_result(m.text.strip())
+
+    elif s == Stage.AWAIT_THUMB:
+        if m.photo:
+            if not task.thumb_future.done(): task.thumb_future.set_result(m)
+        elif m.text and m.text.strip().lower() in ("skip", "s", "/skip"):
+            if not task.thumb_future.done(): task.thumb_future.set_result("SKIP")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CALLBACK HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+@app.on_callback_query()
+async def on_callback(c, q: CallbackQuery):
+    data   = q.data or ""
+    parts  = data.split(":", 2)
+    action = parts[0]
+
+    if action == "cancel_active":
+        task = active_tasks.get(q.message.chat.id)
+        if task:
+            task.cancel_flag.set()
+            _cancel_all_futures(task)
+            await q.answer("🚫 Stopping task...", show_alert=True)
         else:
-            logger.error(f"Pipeline failed: {e}", exc_info=True)
-            await status_message.edit_text(f"❌ Pipeline crashed: {e}")
-    finally:
-        active_jobs.pop(chat_id, None)
-        if not download_complete and local_input and os.path.exists(local_input):
-            os.remove(local_input) # Only delete if it crashed mid-download
-        
-        for f in encoded_files_to_cleanup:
-            if f not in files_to_keep and os.path.exists(f):
-                os.remove(f)
+            await q.answer("No active task.", show_alert=False)
 
-        if thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
+    elif action in ("start", "cancel") and len(parts) >= 2:
+        tid  = parts[1]
+        task = next((t for t in active_tasks.values() if t.task_id == tid), None)
+        if not task: return await q.answer("Task not found.", show_alert=True)
+        if q.from_user.id != task.user_id and not is_admin(q.from_user.id):
+            return await q.answer("Not your task.", show_alert=True)
+        try: await q.message.edit_reply_markup(None)
+        except: pass
+        if action == "start":
+            await q.answer("▶️ Starting encode!")
+            if task.confirm_future and not task.confirm_future.done():
+                task.confirm_future.set_result("start")
+        else:
+            await q.answer("❌ Cancelling…", show_alert=True)
+            if task.confirm_future and not task.confirm_future.done():
+                task.confirm_future.set_result("cancel")
 
-@app.on_callback_query(filters.regex(r"^cancel_job$"))
-async def cancel_job_callback(client, callback_query):
-    chat_id = callback_query.message.chat.id
-    if chat_id in active_jobs:
-        active_jobs[chat_id]['cancel'] = True
-        await callback_query.answer("Cancelling job... Please wait.", show_alert=True)
-        
-        # Kill FFmpeg if it's currently running
-        processes = active_jobs[chat_id].get('processes', [])
-        for process in processes:
+    elif action == "cq" and len(parts) == 3:
+        tid, label = parts[1], parts[2]
+        task = next((t for t in active_tasks.values() if t.task_id == tid), None)
+        if not task: return await q.answer("Task not found.", show_alert=True)
+        cf = task.quality_cancel_flags.get(label)
+        if cf: cf.set()
+        proc = task.quality_procs.get(label)
+        if proc:
+            try: proc.kill()
+            except: pass
+        await q.answer(f"❌ Cancelling {label}…", show_alert=True)
+        try: await q.message.edit_reply_markup(None)
+        except: pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OCR PIPELINE  (/ocr)
+# ══════════════════════════════════════════════════════════════════════════════
+async def _run_ocr(c, m: Message, task: Task):
+    chat_id = task.chat_id
+    status  = await m.reply("⏳ Initializing OCR pipeline…", reply_markup=CANCEL_BTN)
+    task.status_msg = status
+
+    try:
+        # ── 1. DOWNLOAD
+        task.stage = Stage.DOWNLOADING
+        video_path = await _download_video(c, m, task, status)
+        if not video_path: return await safe_edit(status, "❌ No video received or download failed.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        task.input_path = video_path
+        await extract_meta(task)
+
+        # ── 2. GET CUT TIMES
+        task.stage = Stage.AWAIT_CUT
+        dur = get_real_duration(str(task.input_path)) or task.duration_s
+        await safe_edit(status,
+            f"✅ **Downloaded:** `{task.input_path.name}`\n"
+            f"📐 `{task.src_width}×{task.src_height}` | `{fmt_time(dur)}`\n\n"
+            "⏱ **Send cut times** (seconds):\n"
+            "• `120 240` → process from 120 s to 240 s\n"
+            "• `120 120` → skip 120 s from start AND end\n"
+            "• `all`     → process the entire video",
+            CANCEL_BTN,
+        )
+        try: cut_text = await asyncio.wait_for(task.cut_future, timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for cut times.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        start_sec = end_sec = None
+        if cut_text.strip().lower() != "all":
             try:
-                process.terminate()
-            except Exception:
-                pass
-    else:
-        await callback_query.answer("No active job to cancel.", show_alert=True)
+                p = cut_text.strip().split()
+                v1, v2 = float(p[0]), float(p[1])
+                if v2 < 0:          start_sec, end_sec = v1, dur + v2
+                elif v1 >= v2:      start_sec, end_sec = v1, dur - v2
+                else:               start_sec, end_sec = v1, v2
+                if start_sec >= end_sec or start_sec < 0 or end_sec > dur:
+                    return await safe_edit(status, f"❌ Invalid cut times. Duration: `{int(dur)} s`. Computed: `{start_sec:.1f} → {end_sec:.1f} s`.")
+            except:
+                return await safe_edit(status, "❌ Bad format. Use `start end` or `all`.")
 
-@app.on_callback_query(filters.regex(r"^power_"))
-async def power_callback(client, callback_query):
-    if not is_allowed(callback_query.from_user.id):
-        await callback_query.answer("❌ Access Denied.", show_alert=True)
-        return
-    action = callback_query.data.split("_")[1]
-    if action == "off":
-        await callback_query.edit_message_text("🛑 Shutting down Lightning AI server...")
-        deactivate_machine()
-    else:
-        await callback_query.edit_message_text("✅ Server kept alive. You can use `/shutdown` when you are finished.")
+        # ── 3. OCR (22% Bottom Crop)
+        task.stage = Stage.OCR_RUNNING
+        await safe_edit(status, "⚡ Running OCR pipeline…", CANCEL_BTN)
+        cancel_check = lambda: task.cancel_flag.is_set()
+        final_subs = await asyncio.to_thread(run_ocr_pipeline, str(task.input_path), status, chat_id, start_sec, end_sec, cancel_check)
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        task.ocr_subs = final_subs
+        if not final_subs: return await safe_edit(status, "⚠️ No hardsubs detected in the specified range.")
+
+        # ── 4. DELIVER SUBTITLES
+        base = str(task.work_dir / task.input_path.stem)
+        zh_texts = [s["text"] for s in final_subs]
+        zh_srt   = base + "_zh.srt"
+        write_srt(final_subs, zh_texts, zh_srt)
+        await m.reply_document(zh_srt, caption=f"🇨🇳 Chinese OCR — {len(final_subs)} cues")
+
+        if OPENAI_KEY:
+            await safe_edit(status, "🌐 Translating via ChatGPT…", CANCEL_BTN)
+            en_texts = await batch_translate(zh_texts, status, chat_id)
+            if task.cancel_flag.is_set(): raise InterruptedError()
+            en_srt = base + "_en.srt"
+            write_srt(final_subs, en_texts, en_srt)
+            await m.reply_document(en_srt, caption=f"🇬🇧 English (ChatGPT) — {len(final_subs)} cues")
+
+        # ── 5. WAIT FOR MUX SUBTITLE
+        task.stage = Stage.AWAIT_SUB
+        await safe_edit(status,
+            "✅ **OCR complete!**\n\n"
+            "📎 Send the subtitle file (`.srt` / `.ass`) you want muxed into the video.\n"
+            "_(You can forward one of the files sent above, or use a custom one.)_",
+            CANCEL_BTN,
+        )
+        try: sub_msg = await asyncio.wait_for(task.subtitle_future, timeout=600)
+        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for subtitle file.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        await safe_edit(status, "📥 Downloading subtitle…", CANCEL_BTN)
+        sub_dl = task.work_dir / (sub_msg.document.file_name or "subtitle.srt")
+        await sub_msg.download(file_name=str(sub_dl))
+        task.subtitle_path = sub_dl
+
+        # ── 6. OUTPUT NAME
+        task.stage = Stage.AWAIT_NAME
+        await safe_edit(status, "📝 Enter the output filename:\n_(e.g. `Way Of Choices EP01`)_", CANCEL_BTN)
+        try: name_raw = await asyncio.wait_for(task.name_future, timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for filename.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        parse_name(name_raw, task)
+
+        # ── 7. THUMBNAIL
+        task.stage = Stage.AWAIT_THUMB
+        await safe_edit(status, "🖼 Send a **thumbnail photo** (or type `skip`):", CANCEL_BTN)
+        try: thumb_res = await asyncio.wait_for(task.thumb_future, timeout=120)
+        except (asyncio.TimeoutError, asyncio.CancelledError): thumb_res = "SKIP"
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        if thumb_res != "SKIP":
+            tp = await thumb_res.download(file_name=str(task.work_dir / "thumb.jpg"))
+            task.thumb_path = Path(tp)
+
+        # ── 8. MUX
+        task.stage = Stage.MUXING
+        await safe_edit(status, "🔧 Muxing video (stream-copy + subtitle inject)…", CANCEL_BTN)
+        mux_out = task.work_dir / f"{task.raw_name}.mkv"
+        await mux_video(task, task.subtitle_path, mux_out)
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        task.muxed_path = mux_out
+        task.input_path = mux_out      
+        await extract_meta(task)       
+
+        # ── 9. UPLOAD MUXED + ENCODE ALL QUALITIES (Simultaneous) ──────────
+        task.stage = Stage.ENCODING
+        
+        # 🔓 RELEASE CHAT LOCK FOR NEXT JOB 🔓
+        # By removing it from active_tasks here, the user can start a new /ocr command 
+        # while this one happily chugs along in the background.
+        if active_tasks.get(task.chat_id) is task:
+            active_tasks.pop(task.chat_id, None)
+
+        target_chat = resolve_channel(task.series_name) or chat_id
+        await safe_edit(status, f"🚀 **Mux done!** Starting background upload + encode…\n`{task.output_name}`")
+
+        mux_prog = await m.reply("📤 **[MUX]** Uploading…")
+
+        async def _upload_mux():
+            try:
+                await upload_file(target_chat, task.muxed_path, build_mux_caption(task), task.thumb_path, mux_prog, "MUX", task.output_name)
+                try: await mux_prog.edit("✅ **[MUX]** Upload complete! 🎉")
+                except: pass
+            except Exception as e:
+                log.exception("[MUX] upload failed")
+                try: await mux_prog.edit(f"❌ **[MUX]** Upload failed: `{e}`")
+                except: pass
+
+        await asyncio.gather(_upload_mux(), encode_all(task, m, target_chat))
+        task.stage = Stage.DONE
+
+    except InterruptedError:
+        await safe_edit(status, "🚫 **Task Cancelled.**")
+    except Exception as e:
+        log.exception("OCR pipeline crashed")
+        tb  = traceback.format_exc()
+        buf = io.BytesIO(tb.encode()); buf.name = f"error_{task.task_id}.log"
+        buf.seek(0)
+        await m.reply_document(buf, caption=f"❌ **Crash:** `{e}`")
+    finally:
+        cleanup_task(task)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENC PIPELINE  (/enc)
+# ══════════════════════════════════════════════════════════════════════════════
+async def _run_enc(c, m: Message, task: Task):
+    chat_id = task.chat_id
+    status  = await m.reply("⏳ Initializing encoder…", reply_markup=CANCEL_BTN)
+    task.status_msg = status
+
+    try:
+        task.stage = Stage.DOWNLOADING
+        video_path = await _download_video(c, m, task, status)
+        if not video_path: return await safe_edit(status, "❌ No video received.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        task.input_path = video_path
+        await extract_meta(task)
+
+        task.stage = Stage.AWAIT_NAME
+        await m.reply(f"✅ Downloaded: `{task.input_path.name}`\n📐 `{task.src_width}×{task.src_height}` | `{fmt_time(task.duration_s)}`\n\n📝 **Enter base filename** (e.g. `Way Of Choices EP01`):")
+        try: name_raw = await asyncio.wait_for(task.name_future, timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError): return await m.reply("⏰ Timed out waiting for filename.")
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        parse_name(name_raw, task)
+
+        task.stage = Stage.AWAIT_THUMB
+        await m.reply("🖼 **Send thumbnail photo** (or type `skip`):")
+        try: thumb_res = await asyncio.wait_for(task.thumb_future, timeout=120)
+        except (asyncio.TimeoutError, asyncio.CancelledError): thumb_res = "SKIP"
+        if task.cancel_flag.is_set(): raise InterruptedError()
+        if thumb_res != "SKIP":
+            tp = await thumb_res.download(file_name=str(task.work_dir / "thumb.jpg"))
+            task.thumb_path = Path(tp)
+
+        task.stage = Stage.CONFIRMING
+        ch_id = resolve_channel(task.series_name)
+        lines = ["📋 **Confirm encode job:**\n"]
+        for spec in QUALITY_SPECS: lines.append(f"• `{out_filename(task.output_name, spec.label)}`")
+        lines.append(f"\n📡 Channel: `{ch_id}`" if ch_id else "\n📡 No channel match — posting here")
+        confirm_msg = await m.reply("\n".join(lines), reply_markup=confirm_kb(task.task_id))
+        
+        try: decision = await asyncio.wait_for(task.confirm_future, timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError): decision = "cancel"
+        if decision == "cancel":
+            try: await confirm_msg.edit_reply_markup(None)
+            except: pass
+            return await m.reply("🚫 Job cancelled.")
+        try: await confirm_msg.edit_reply_markup(None)
+        except: pass
+
+        task.stage = Stage.ENCODING
+        
+        # 🔓 RELEASE CHAT LOCK FOR NEXT JOB 🔓
+        if active_tasks.get(task.chat_id) is task:
+            active_tasks.pop(task.chat_id, None)
+
+        target_chat = ch_id if ch_id else task.chat_id
+        await m.reply(f"🚀 **Encoding started in background!** `{task.output_name}`\nThree progress messages will appear below ↓")
+        await encode_all(task, m, target_chat)
+        task.stage = Stage.DONE
+
+    except InterruptedError:
+        await safe_edit(status, "🚫 **Task Cancelled.**")
+    except Exception as e:
+        log.exception("ENC pipeline crashed")
+        tb  = traceback.format_exc()
+        buf = io.BytesIO(tb.encode()); buf.name = f"error_{task.task_id}.log"
+        buf.seek(0)
+        await m.reply_document(buf, caption=f"❌ **Crash:** `{e}`")
+    finally:
+        cleanup_task(task)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+async def main():
+    global EVENT_LOOP
+    EVENT_LOOP = asyncio.get_running_loop()
+    log.info("TheFrictionRealm Combined Bot — starting…")
+    await app.start()
+    log.info("✅ Bot ready!")
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    print("🌩️ Pyrogram Bot Starting. Waiting for Telegram connection...")
-    app.run()
+    try: asyncio.get_running_loop().create_task(main())
+    except RuntimeError: asyncio.run(main())
