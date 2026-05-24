@@ -1245,222 +1245,440 @@ async def on_callback(c, q: CallbackQuery):
 # ══════════════════════════════════════════════════════════════════════════════
 async def _run_ocr(c, m: Message, task: Task):
     chat_id = task.chat_id
-    status  = await m.reply("⏳ Initializing OCR pipeline…", reply_markup=CANCEL_BTN)
+
+    status = await m.reply(
+        "⏳ Initializing OCR pipeline…",
+        reply_markup=CANCEL_BTN
+    )
+
     task.status_msg = status
 
     try:
-        # ── 1. DOWNLOAD
+        # ═══════════════════════════════════════════════════════
+        # 1. DOWNLOAD VIDEO
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.DOWNLOADING
-        video_path = await _download_video(c, m, task, status)
-        if not video_path: return await safe_edit(status, "❌ No video received or download failed.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        video_path = await _download_video(
+            c,
+            m,
+            task,
+            status
+        )
+
+        if not video_path:
+            return await safe_edit(
+                status,
+                "❌ No video received or download failed."
+            )
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
         task.input_path = video_path
+
         await extract_meta(task)
 
-        # ── 2. GET CUT TIMES
+        # ═══════════════════════════════════════════════════════
+        # 2. ASK CUT TIMES
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.AWAIT_CUT
-        dur = get_real_duration(str(task.input_path)) or task.duration_s
-        await safe_edit(status,
+
+        dur = (
+            get_real_duration(str(task.input_path))
+            or task.duration_s
+        )
+
+        await safe_edit(
+            status,
             f"✅ **Downloaded:** `{task.input_path.name}`\n"
             f"📐 `{task.src_width}×{task.src_height}` | `{fmt_time(dur)}`\n\n"
-            "⏱ **Send cut times** (seconds):\n"
-            "• `120 240` → process from 120 s to 240 s\n"
-            "• `120 120` → skip 120 s from start AND end\n"
-            "• `all`     → process the entire video",
+            "⏱ **Send cut times:**\n"
+            "• `120 240` → OCR from 120s to 240s\n"
+            "• `120 120` → skip first 120s and last 120s\n"
+            "• `all` → OCR full video",
             CANCEL_BTN,
         )
-        try: cut_text = await asyncio.wait_for(task.cut_future, timeout=300)
-        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for cut times.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
 
-        start_sec = end_sec = None
+        try:
+            cut_text = await asyncio.wait_for(
+                task.cut_future,
+                timeout=300
+            )
+
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return await safe_edit(
+                status,
+                "⏰ Timed out waiting for cut times."
+            )
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
+        start_sec = None
+        end_sec = None
+
         if cut_text.strip().lower() != "all":
+
             try:
                 p = cut_text.strip().split()
-                v1, v2 = float(p[0]), float(p[1])
-                if v2 < 0:          start_sec, end_sec = v1, dur + v2
-                elif v1 >= v2:      start_sec, end_sec = v1, dur - v2
-                else:               start_sec, end_sec = v1, v2
-                if start_sec >= end_sec or start_sec < 0 or end_sec > dur:
-                    return await safe_edit(status, f"❌ Invalid cut times. Duration: `{int(dur)} s`. Computed: `{start_sec:.1f} → {end_sec:.1f} s`.")
-            except:
-                return await safe_edit(status, "❌ Bad format. Use `start end` or `all`.")
 
-        # ── 3. OCR (22% Bottom Crop)
+                v1 = float(p[0])
+                v2 = float(p[1])
+
+                if v2 < 0:
+                    start_sec = v1
+                    end_sec = dur + v2
+
+                elif v1 >= v2:
+                    start_sec = v1
+                    end_sec = dur - v2
+
+                else:
+                    start_sec = v1
+                    end_sec = v2
+
+                if (
+                    start_sec >= end_sec
+                    or start_sec < 0
+                    or end_sec > dur
+                ):
+                    return await safe_edit(
+                        status,
+                        f"❌ Invalid cut times.\n"
+                        f"Duration: `{int(dur)}s`\n"
+                        f"Computed: `{start_sec:.1f} → {end_sec:.1f}`"
+                    )
+
+            except Exception:
+                return await safe_edit(
+                    status,
+                    "❌ Bad format. Use `start end` or `all`."
+                )
+
+        # ═══════════════════════════════════════════════════════
+        # 3. RUN OCR
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.OCR_RUNNING
-        await safe_edit(status, "⚡ Running OCR pipeline…", CANCEL_BTN)
-        cancel_check = lambda: task.cancel_flag.is_set()
-        final_subs = await asyncio.to_thread(run_ocr_pipeline, str(task.input_path), status, chat_id, start_sec, end_sec, cancel_check)
-        if task.cancel_flag.is_set(): raise InterruptedError()
-        task.ocr_subs = final_subs
-        if not final_subs: return await safe_edit(status, "⚠️ No hardsubs detected in the specified range.")
 
-        # ── 4. DELIVER SUBTITLES
-        base = str(task.work_dir / task.input_path.stem)
-        zh_texts = [s["text"] for s in final_subs]
-        zh_srt   = base + "_zh.srt"
-        write_srt(final_subs, zh_texts, zh_srt)
-        await m.reply_document(zh_srt, caption=f"🇨🇳 Chinese OCR — {len(final_subs)} cues")
-
-        if OPENAI_KEY:
-            await safe_edit(status, "🌐 Translating via ChatGPT…", CANCEL_BTN)
-            en_texts = await batch_translate(zh_texts, status, chat_id)
-            if task.cancel_flag.is_set(): raise InterruptedError()
-            en_srt = base + "_en.srt"
-            write_srt(final_subs, en_texts, en_srt)
-            await m.reply_document(en_srt, caption=f"🇬🇧 English (ChatGPT) — {len(final_subs)} cues")
-
-        # ── 5. WAIT FOR MUX SUBTITLE
-        task.stage = Stage.AWAIT_SUB
-        await safe_edit(status,
-            "✅ **OCR complete!**\n\n"
-            "📎 Send the subtitle file (`.srt` / `.ass`) you want muxed into the video.\n"
-            "_(You can forward one of the files sent above, or use a custom one.)_",
+        await safe_edit(
+            status,
+            "⚡ Running OCR on RTX P6000…",
             CANCEL_BTN,
         )
-        try: sub_msg = await asyncio.wait_for(task.subtitle_future, timeout=600)
-        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for subtitle file.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
 
-        await safe_edit(status, "📥 Downloading subtitle…", CANCEL_BTN)
-        sub_dl = task.work_dir / (sub_msg.document.file_name or "subtitle.srt")
-        await sub_msg.download(file_name=str(sub_dl))
+        cancel_check = lambda: task.cancel_flag.is_set()
+
+        final_subs = await asyncio.to_thread(
+            run_ocr_pipeline,
+            str(task.input_path),
+            status,
+            chat_id,
+            start_sec,
+            end_sec,
+            cancel_check,
+        )
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
+        task.ocr_subs = final_subs
+
+        if not final_subs:
+            return await safe_edit(
+                status,
+                "⚠️ No subtitles detected."
+            )
+
+        # ═══════════════════════════════════════════════════════
+        # 4. CREATE OCR SRT
+        # ═══════════════════════════════════════════════════════
+        base = str(task.work_dir / task.input_path.stem)
+
+        zh_texts = [
+            s["text"]
+            for s in final_subs
+        ]
+
+        zh_srt = base + "_zh.srt"
+
+        write_srt(
+            final_subs,
+            zh_texts,
+            zh_srt
+        )
+
+        await m.reply_document(
+            zh_srt,
+            caption=f"🇨🇳 Chinese OCR — {len(final_subs)} cues"
+        )
+
+        # ═══════════════════════════════════════════════════════
+        # 5. TRANSLATE
+        # ═══════════════════════════════════════════════════════
+        if OPENAI_KEY:
+
+            await safe_edit(
+                status,
+                "🌐 Translating subtitles…",
+                CANCEL_BTN,
+            )
+
+            en_texts = await batch_translate(
+                zh_texts,
+                status,
+                chat_id
+            )
+
+            if task.cancel_flag.is_set():
+                raise InterruptedError()
+
+            en_srt = base + "_en.srt"
+
+            write_srt(
+                final_subs,
+                en_texts,
+                en_srt
+            )
+
+            await m.reply_document(
+                en_srt,
+                caption=f"🇬🇧 English — {len(final_subs)} cues"
+            )
+
+        # ═══════════════════════════════════════════════════════
+        # 6. WAIT FOR FINAL SUBTITLE FILE
+        # ═══════════════════════════════════════════════════════
+        task.stage = Stage.AWAIT_SUB
+
+        await safe_edit(
+            status,
+            "📎 Send subtitle file to mux (`.srt` / `.ass`).\n"
+            "You can forward the OCR subtitle sent above.",
+            CANCEL_BTN,
+        )
+
+        try:
+            sub_msg = await asyncio.wait_for(
+                task.subtitle_future,
+                timeout=600
+            )
+
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return await safe_edit(
+                status,
+                "⏰ Timed out waiting for subtitle."
+            )
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
+        await safe_edit(
+            status,
+            "📥 Downloading subtitle…",
+            CANCEL_BTN,
+        )
+
+        sub_dl = task.work_dir / (
+            sub_msg.document.file_name
+            or "subtitle.srt"
+        )
+
+        await sub_msg.download(
+            file_name=str(sub_dl)
+        )
+
         task.subtitle_path = sub_dl
 
-        # ── 6. OUTPUT NAME
+        # ═══════════════════════════════════════════════════════
+        # 7. ASK OUTPUT NAME
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.AWAIT_NAME
-        await safe_edit(status, "📝 Enter the output filename:\n_(e.g. `Way Of Choices EP01`)_", CANCEL_BTN)
-        try: name_raw = await asyncio.wait_for(task.name_future, timeout=300)
-        except (asyncio.TimeoutError, asyncio.CancelledError): return await safe_edit(status, "⏰ Timed out waiting for filename.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        await safe_edit(
+            status,
+            "📝 Enter output filename:\n"
+            "_(Example: `Perfect World EP270`)_",
+            CANCEL_BTN,
+        )
+
+        while True:
+
+            try:
+                name_raw = await asyncio.wait_for(
+                    task.name_future,
+                    timeout=300
+                )
+
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                return await safe_edit(
+                    status,
+                    "⏰ Timed out waiting for filename."
+                )
+
+            if task.cancel_flag.is_set():
+                raise InterruptedError()
+
+            cleaned = name_raw.strip().lower()
+
+            # ignore telegram protector replies
+            if any(x in cleaned for x in (
+                "access denied",
+                "permission denied",
+                "forbidden",
+                "blocked"
+            )):
+                if not task.name_future.done():
+                    task.name_future = asyncio.get_running_loop().create_future()
+                continue
+
+            break
+
         parse_name(name_raw, task)
 
-        # ── 7. THUMBNAIL
+        # ═══════════════════════════════════════════════════════
+        # 8. ASK THUMB
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.AWAIT_THUMB
-        await safe_edit(status, "🖼 Send a **thumbnail photo** (or type `skip`):", CANCEL_BTN)
-        try: thumb_res = await asyncio.wait_for(task.thumb_future, timeout=120)
-        except (asyncio.TimeoutError, asyncio.CancelledError): thumb_res = "SKIP"
-        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        await safe_edit(
+            status,
+            "🖼 Send thumbnail photo or type `skip`.",
+            CANCEL_BTN,
+        )
+
+        try:
+            thumb_res = await asyncio.wait_for(
+                task.thumb_future,
+                timeout=120
+            )
+
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            thumb_res = "SKIP"
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
         if thumb_res != "SKIP":
-            tp = await thumb_res.download(file_name=str(task.work_dir / "thumb.jpg"))
+
+            tp = await thumb_res.download(
+                file_name=str(task.work_dir / "thumb.jpg")
+            )
+
             task.thumb_path = Path(tp)
 
-        # ── 8. MUX
+        # ═══════════════════════════════════════════════════════
+        # 9. MUX
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.MUXING
-        await safe_edit(status, "🔧 Muxing video (stream-copy + subtitle inject)…", CANCEL_BTN)
+
+        await safe_edit(
+            status,
+            "🔧 Muxing video…",
+            CANCEL_BTN,
+        )
+
         mux_out = task.work_dir / f"{task.raw_name}.mkv"
-        await mux_video(task, task.subtitle_path, mux_out)
-        if task.cancel_flag.is_set(): raise InterruptedError()
+
+        await mux_video(
+            task,
+            task.subtitle_path,
+            mux_out
+        )
+
+        if task.cancel_flag.is_set():
+            raise InterruptedError()
+
         task.muxed_path = mux_out
-        task.input_path = mux_out      
-        await extract_meta(task)       
+        task.input_path = mux_out
 
-        # ── 9. UPLOAD MUXED + ENCODE ALL QUALITIES (Simultaneous) ──────────
-        task.stage = Stage.ENCODING
-        
-        # 🔓 RELEASE CHAT LOCK FOR NEXT JOB 🔓
-        if active_tasks.get(task.chat_id) is task:
-            active_tasks.pop(task.chat_id, None)
-
-        target_chat = resolve_channel(task.series_name) or chat_id
-        await safe_edit(status, f"🚀 **Mux done!** Starting background upload + encode…\n`{task.output_name}`")
-
-        mux_prog = await m.reply("📤 **[MUX]** Uploading…")
-
-        async def _upload_mux():
-            try:
-                await upload_file(target_chat, task.muxed_path, build_mux_caption(task), task.thumb_path, mux_prog, "MUX", task.output_name)
-                try: await mux_prog.edit("✅ **[MUX]** Upload complete! 🎉")
-                except: pass
-            except Exception as e:
-                log.exception("[MUX] upload failed")
-                try: await mux_prog.edit(f"❌ **[MUX]** Upload failed: `{e}`")
-                except: pass
-
-        await asyncio.gather(_upload_mux(), encode_all(task, m, target_chat))
-        task.stage = Stage.DONE
-
-    except InterruptedError:
-        await safe_edit(status, "🚫 **Task Cancelled.**")
-    except Exception as e:
-        log.exception("OCR pipeline crashed")
-        tb  = traceback.format_exc()
-        buf = io.BytesIO(tb.encode()); buf.name = f"error_{task.task_id}.log"
-        buf.seek(0)
-        await m.reply_document(buf, caption=f"❌ **Crash:** `{e}`")
-    finally:
-        cleanup_task(task)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENC PIPELINE  (/enc)
-# ══════════════════════════════════════════════════════════════════════════════
-async def _run_enc(c, m: Message, task: Task):
-    chat_id = task.chat_id
-    status  = await m.reply("⏳ Initializing encoder…", reply_markup=CANCEL_BTN)
-    task.status_msg = status
-
-    try:
-        task.stage = Stage.DOWNLOADING
-        video_path = await _download_video(c, m, task, status)
-        if not video_path: return await safe_edit(status, "❌ No video received.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
-        task.input_path = video_path
         await extract_meta(task)
 
-        task.stage = Stage.AWAIT_NAME
-        await m.reply(f"✅ Downloaded: `{task.input_path.name}`\n📐 `{task.src_width}×{task.src_height}` | `{fmt_time(task.duration_s)}`\n\n📝 **Enter base filename** (e.g. `Way Of Choices EP01`):")
-        try: name_raw = await asyncio.wait_for(task.name_future, timeout=300)
-        except (asyncio.TimeoutError, asyncio.CancelledError): return await m.reply("⏰ Timed out waiting for filename.")
-        if task.cancel_flag.is_set(): raise InterruptedError()
-        parse_name(name_raw, task)
-
-        task.stage = Stage.AWAIT_THUMB
-        await m.reply("🖼 **Send thumbnail photo** (or type `skip`):")
-        try: thumb_res = await asyncio.wait_for(task.thumb_future, timeout=120)
-        except (asyncio.TimeoutError, asyncio.CancelledError): thumb_res = "SKIP"
-        if task.cancel_flag.is_set(): raise InterruptedError()
-        if thumb_res != "SKIP":
-            tp = await thumb_res.download(file_name=str(task.work_dir / "thumb.jpg"))
-            task.thumb_path = Path(tp)
-
-        task.stage = Stage.CONFIRMING
-        ch_id = resolve_channel(task.series_name)
-        lines = ["📋 **Confirm encode job:**\n"]
-        for spec in QUALITY_SPECS: lines.append(f"• `{out_filename(task.output_name, spec.label)}`")
-        lines.append(f"\n📡 Channel: `{ch_id}`" if ch_id else "\n📡 No channel match — posting here")
-        confirm_msg = await m.reply("\n".join(lines), reply_markup=confirm_kb(task.task_id))
-        
-        try: decision = await asyncio.wait_for(task.confirm_future, timeout=300)
-        except (asyncio.TimeoutError, asyncio.CancelledError): decision = "cancel"
-        if decision == "cancel":
-            try: await confirm_msg.edit_reply_markup(None)
-            except: pass
-            return await m.reply("🚫 Job cancelled.")
-        try: await confirm_msg.edit_reply_markup(None)
-        except: pass
-
+        # ═══════════════════════════════════════════════════════
+        # 10. ENCODE + UPLOAD
+        # ═══════════════════════════════════════════════════════
         task.stage = Stage.ENCODING
-        
-        # 🔓 RELEASE CHAT LOCK FOR NEXT JOB 🔓
+
         if active_tasks.get(task.chat_id) is task:
             active_tasks.pop(task.chat_id, None)
 
-        target_chat = ch_id if ch_id else task.chat_id
-        await m.reply(f"🚀 **Encoding started in background!** `{task.output_name}`\nThree progress messages will appear below ↓")
-        await encode_all(task, m, target_chat)
+        target_chat = (
+            resolve_channel(task.series_name)
+            or chat_id
+        )
+
+        await safe_edit(
+            status,
+            f"🚀 Starting encode + upload:\n"
+            f"`{task.output_name}`"
+        )
+
+        mux_prog = await m.reply(
+            "📤 Uploading muxed file…"
+        )
+
+        async def _upload_mux():
+
+            try:
+                await upload_file(
+                    target_chat,
+                    task.muxed_path,
+                    build_mux_caption(task),
+                    task.thumb_path,
+                    mux_prog,
+                    "MUX",
+                    task.output_name,
+                )
+
+                try:
+                    await mux_prog.edit(
+                        "✅ Mux upload complete!"
+                    )
+                except:
+                    pass
+
+            except Exception as e:
+
+                log.exception("[MUX] upload failed")
+
+                try:
+                    await mux_prog.edit(
+                        f"❌ Upload failed:\n`{e}`"
+                    )
+                except:
+                    pass
+
+        await asyncio.gather(
+            _upload_mux(),
+            encode_all(task, m, target_chat),
+        )
+
         task.stage = Stage.DONE
 
     except InterruptedError:
-        await safe_edit(status, "🚫 **Task Cancelled.**")
+
+        await safe_edit(
+            status,
+            "🚫 Task cancelled."
+        )
+
     except Exception as e:
-        log.exception("ENC pipeline crashed")
-        tb  = traceback.format_exc()
-        buf = io.BytesIO(tb.encode()); buf.name = f"error_{task.task_id}.log"
+
+        log.exception("OCR pipeline crashed")
+
+        tb = traceback.format_exc()
+
+        buf = io.BytesIO(tb.encode())
+        buf.name = f"error_{task.task_id}.log"
         buf.seek(0)
-        await m.reply_document(buf, caption=f"❌ **Crash:** `{e}`")
+
+        await m.reply_document(
+            buf,
+            caption=f"❌ Crash:\n`{e}`"
+        )
+
     finally:
         cleanup_task(task)
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
