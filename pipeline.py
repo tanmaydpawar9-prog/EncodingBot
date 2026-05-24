@@ -611,15 +611,14 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
          f"RTX 6000 scanning {total_frames:,} frames…",
          CANCEL_BTN)
 
-    def make_cmd(ss: float, dur: float, thr: str = "4") -> list:
+    def make_cmd(ss: float, dur: float, thr: str = "8") -> list:
         return [
             "ffmpeg", "-v", "error", "-y",
-            "-hwaccel", "cuda", "-threads", thr,
+            "-threads", thr,
             "-ss", str(ss), "-i", video_path, "-t", str(dur),
             "-vf", vf, "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-",
         ]
-
     if NUM_GPUS >= 2:
         # Dual-GPU split (future-proof for dual-GPU Lightning setups)
         mid, ov = proc_dur / 2.0, 2.0
