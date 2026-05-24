@@ -1463,10 +1463,12 @@ async def cmd_shutdown(c, m: Message):
 # filters.user = only messages from real users (excludes bots, channels, etc.)
 # This prevents the bot from reacting to its own messages or other bots' replies.
 @app.on_message(
-    filters.user
-    & ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
+    ~filters.command(["ocr", "enc", "log", "cancel", "start", "status", "shutdown"])
 )
 async def msg_router(c, m: Message):
+    # This line inside the function handles the user/bot check perfectly
+    if not m.from_user or m.from_user.is_bot: 
+        return
     task = active_tasks.get(m.chat.id)
     if not task or task.stage in (Stage.DONE, Stage.CANCELLED): return
 
