@@ -38,18 +38,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("FrBot")
 
-# Fallback to os.environ if Kaggle secrets aren't available (useful for Lightning AI)
-try:
-    _sec = UserSecretsClient()
-    API_ID       = int(_sec.get_secret("API_ID") or os.getenv("API_ID", 0))
-    API_HASH     = _sec.get_secret("API_HASH") or os.getenv("API_HASH", "")
-    BOT_TOKEN    = _sec.get_secret("BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
-    OPENAI_KEY   = _sec.get_secret("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-except Exception:
-    API_ID       = int(os.getenv("API_ID", 0))
-    API_HASH     = os.getenv("API_HASH", "")
-    BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
-    OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "")
+# Standard Environment Variables for Lightning AI
+API_ID       = int(os.getenv("API_ID", 0))
+API_HASH     = os.getenv("API_HASH", "")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
+OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "")
 
 ADMIN_IDS       = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 CHANNEL_MAP_RAW = os.environ.get("CHANNEL_MAP", "")
@@ -214,7 +207,6 @@ def new_task(mode: Mode, chat_id: int, user_id: int) -> Task:
 
 def cleanup_task(t: Task):
     # Only pop from active_tasks if this specific task is still the one locked to the chat
-    # (prevents deleting the lock for a new job if they overlapped)
     if active_tasks.get(t.chat_id) is t:
         active_tasks.pop(t.chat_id, None)
     if t.work_dir and t.work_dir.exists():
@@ -396,25 +388,40 @@ def _norm_ocr_key(txt: str) -> str:
     return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
 def suppress_static_overlay_cues(subs: list, frame_w: int, frame_h: int, total_dur: float) -> list:
-    # Simplified suppression wrapper for stability
+    # Simplified suppression wrapper
     if not subs: return []
     kept = sorted(subs, key=lambda x: x["start"])
     return kept
+
+def _read_exact(pipe, size):
+    """Guarantees FFmpeg pipe doesn't crash on partial byte chunks during variable frame shifts."""
+    buf = bytearray(size)
+    view = memoryview(buf)
+    to_read = size
+    while to_read > 0:
+        n = pipe.readinto(view)
+        if not n: return None
+        view = view[n:]
+        to_read -= n
+    return bytes(buf)
 
 def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
     cues    = []
     frame_q = queue.Queue(maxsize=128)
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
     time.sleep(0.5)
+    
     if process.poll() is not None and process.returncode != 0:
-        raise RuntimeError("FFmpeg pipe crashed on startup.")
+        err = process.stderr.read(500).decode(errors="replace")
+        raise RuntimeError(f"FFmpeg pipe crashed on startup: {err}")
 
     def _reader():
         idx = 0
         while True:
             if cancel_check(): process.terminate(); break
-            raw = process.stdout.read(bytes_per_frame)
-            if not raw or len(raw) != bytes_per_frame: break
+            # Safely read exact frame size to prevent silent EOF crashes
+            raw = _read_exact(process.stdout, bytes_per_frame)
+            if not raw: break
             frame_q.put((idx, raw)); idx += 1
         frame_q.put(None)
 
@@ -433,20 +440,46 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_
         _, max_val, _, _ = cv2.minMaxLoc(gray)
 
         if max_val >= 50:
-            try:    result = engine.ocr(frame, cls=False)
-            except: result = None
+            try:
+                result = engine.ocr(frame, cls=False)
+            except Exception as e:
+                # Do NOT silently swallow errors anymore
+                log.error(f"OCR Inference Error at frame {frame_idx}: {e}")
+                result = None
 
             if result and result[0]:
-                for ln in result[0]:
+                img_w = frame.shape[1]
+                if is_target_res:
+                    lines = [ln for ln in result[0] if ln[1][1] >= 0.25]
+                else:
+                    l, r = img_w * 0.10, img_w * 0.80
+                    lines = [
+                        ln for ln in result[0]
+                        if ln[1][1] >= 0.25
+                        and l <= sum(p[0] for p in ln[0]) / 4 <= r
+                    ]
+                    
+                for ln in lines:
                     raw_text = ln[1][0].strip()
                     cmp_text = _norm_ocr_key(raw_text)
-                    if len(cmp_text) >= 1 and ln[1][1] >= 0.25:
-                        xs = [p[0] for p in ln[0]]; ys = [p[1] for p in ln[0]]
+                    if len(cmp_text) >= 1:
+                        xs = [p[0] for p in ln[0]]
+                        ys = [p[1] for p in ln[0]]
+                        
+                        x_center = sum(xs) / len(xs)
+                        y_center = sum(ys) / len(ys)
+                        box_w = max(xs) - min(xs)
+                        box_h = max(ys) - min(ys)
+                        
                         cues.append({
-                            "start": cur_t, "end": round(cur_t + frame_dur, 3),
-                            "text": raw_text, "cmp": cmp_text,
-                            "x": sum(xs)/len(xs), "y": sum(ys)/len(ys),
-                            "bw": max(xs)-min(xs), "bh": max(ys)-min(ys),
+                            "start": cur_t,
+                            "end":   round(cur_t + frame_dur, 3),
+                            "text":  raw_text,
+                            "cmp":   cmp_text,
+                            "x":     float(x_center),
+                            "y":     float(y_center),
+                            "bw":    float(box_w),
+                            "bh":    float(box_h),
                         })
 
     process.stdout.close(); process.wait()
@@ -480,8 +513,9 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
     t0 = time.time()
 
     def make_cmd(ss, dur, vf, thr="4"):
+        # Removed -hwaccel cuda for 100% stable raw frame piping
         return [
-            "ffmpeg", "-v", "error", "-y", "-hwaccel", "cuda", "-threads", thr,
+            "ffmpeg", "-v", "error", "-y", "-threads", thr,
             "-ss", str(ss), "-i", video_path, "-t", str(dur),
             "-vf", vf, "-r", str(extract_fps),
             "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
@@ -506,7 +540,7 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
                 last_ui[0] = time.time()
                 push(status_msg, pb_frames("Direct Stream OCR", fi, total_frames, t0, f"💬 Cues: {len(cl)}"), CANCEL_BTN)
 
-        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, True, _progress)
+        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, False, _progress)
         raw = stitch_continuous_lines(raw)
         return suppress_static_overlay_cues(raw, crop_w, crop_h, proc_dur)
 
@@ -933,7 +967,8 @@ async def quality_worker(task: Task, spec: QualitySpec, trigger_msg: Message, ta
 
     if err_str:
         log.error(f"[{label}] encode error: {err_str[:200]}")
-        try: await prog_msg.edit(f"❌ **[{label}]** Encode failed:\n```\n{err_str[:2000]}\n```", reply_markup=None)
+        try: await prog_msg.edit(f"❌ **[{label}]** Encode failed:\n```\n{err_str[:2000]}\n
+```", reply_markup=None)
         except: pass
         task.encode_done_flags[label].set(); return
 
@@ -1270,8 +1305,6 @@ async def _run_ocr(c, m: Message, task: Task):
         task.stage = Stage.ENCODING
         
         # 🔓 RELEASE CHAT LOCK FOR NEXT JOB 🔓
-        # By removing it from active_tasks here, the user can start a new /ocr command 
-        # while this one happily chugs along in the background.
         if active_tasks.get(task.chat_id) is task:
             active_tasks.pop(task.chat_id, None)
 
