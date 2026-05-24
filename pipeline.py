@@ -550,6 +550,14 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, 
 
     process.stdout.close(); process.wait()
     return cues
+def get_real_duration(path: str) -> float:
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path])
+        return float(out.decode().strip())
+    except: return 0.0
+
 
 def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=None, cancel_check=None):
     if cancel_check is None: cancel_check = lambda: False
