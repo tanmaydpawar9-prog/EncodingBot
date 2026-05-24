@@ -771,7 +771,7 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
         while any(th.is_alive() for th in threads):
             if cancel_check(): break
             now = time.time()
-            if now - last_ui > STATUS_REFRESH_SECS:
+            if now - last_ui > REFRESH:
                 last_ui = now
                 with _lock:
                     p0, p1 = _prog[0], _prog[1]
@@ -808,9 +808,10 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
         last_ui = [time.time()]
         def _progress(f_idx, cues_list):
             now = time.time()
-            if now - last_ui[0] > STATUS_REFRESH_SECS:
+            if now - last_ui[0] > REFRESH:  # <--- CHANGED HERE
                 last_ui[0] = now
-                _push(status_msg, f"{build_pb('Direct Stream OCR', f_idx, src_total_frames, scan_t0, False)}\n💬 Cues: {len(cues_list)}", CANCEL_BTN)
+                # Also updating the push command to use the V3 UI helpers
+                push(status_msg, pb_frames("Targeted Zone OCR", f_idx, src_total_frames, scan_t0, f"💬 Raw Cues: {len(cues_list)}"), CANCEL_BTN)
 
         # ADDED CROP_X AND CROP_Y HERE
         raw_subs = _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, crop_x, crop_y, extract_fps, start0, cancel_check, is_target_res, progress_cb=_progress)
