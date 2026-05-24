@@ -23,7 +23,6 @@ from typing import Optional
 import cv2, yt_dlp, numpy as np, nest_asyncio
 nest_asyncio.apply()
 
-from kaggle_secrets import UserSecretsClient
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified, FloodWait
