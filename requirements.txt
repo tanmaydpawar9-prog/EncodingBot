@@ -1,3 +1,32 @@
-requests>=2.28.0
-pyrogram>=2.0.106
-tgcrypto>=1.2.5
+# Core Bot & Async
+pyrogram
+tgcrypto
+nest_asyncio
+
+# Video & Downloads
+yt-dlp
+requests
+
+# AI & Translation
+openai
+
+# Computer Vision & OCR (Version Locked for Stability)
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+opencv-contrib-python==4.9.0.80
+paddlepaddle-gpu==2.6.1
+paddleocr==2.8.1
+albumentations==1.4.0
+
+# PaddleOCR Dependencies (Version Locked to prevent breaking changes)
+matplotlib<3.9.0
+contourpy<1.2.1
+shapely<2.0.4
+pandas<2.2.0
+scipy<1.13.0
+scikit-image<0.23.0
+Pillow<11.0.0
+
+# Utilities
+thefuzz
+aiohttp
