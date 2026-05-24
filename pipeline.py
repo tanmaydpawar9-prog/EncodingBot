@@ -1441,7 +1441,7 @@ async def cmd_shutdown(c, m: Message):
 
 # ── Universal message router ──────────────────────────────────────────────────
 @app.on_message(
-    filters.user
+    filters.all
     & ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
 )
 async def msg_router(c, m: Message):
