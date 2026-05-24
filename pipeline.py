@@ -54,15 +54,15 @@ WORK  = BASE / "work"
 for _d in [FILES, TMP, WORK]: _d.mkdir(parents=True, exist_ok=True)
 
 EVENT_LOOP     = None
-REFRESH        = 5       # UI update interval (seconds)
+REFRESH        = 5       
 UPLOAD_TAG     = "TheFrictionRealm"
 MIN_GAP_SEC    = 0.04
 _OCR_ENGINES   = {}
 
 # RTX A6000 Concurrency Controls
-dl_semaphore  = asyncio.Semaphore(4)   # Max concurrent downloads
-mux_semaphore = asyncio.Semaphore(3)   # Unrestricted NVENC allows 3+ parallel encodes
-ul_semaphore  = asyncio.Semaphore(6)   # Max concurrent Telegram uploads
+dl_semaphore  = asyncio.Semaphore(4)   
+mux_semaphore = asyncio.Semaphore(3)   
+ul_semaphore  = asyncio.Semaphore(6)   
 
 # ── HTTP SERVER FOR >2GB FILES ────────────────────────────────────────────────
 HTTP_PORT = 8000
@@ -147,29 +147,24 @@ class Task:
     user_id:  int   = 0
     stage:    Stage = Stage.IDLE
 
-    # Paths
     work_dir:      Optional[Path] = None
     input_path:    Optional[Path] = None
     subtitle_path: Optional[Path] = None
     muxed_path:    Optional[Path] = None
     thumb_path:    Optional[Path] = None
 
-    # Naming
     output_name:  str = ""
     raw_name:     str = ""
     series_name:  str = ""
     episode_tag:  str = ""
 
-    # Video metadata
     duration_s:  float = 0.0
     src_bitrate: int   = 0
     src_width:   int   = 0
     src_height:  int   = 0
 
-    # OCR results
     ocr_subs: list = field(default_factory=list)
 
-    # Cancellation
     cancel_flag:          Optional[asyncio.Event] = None
     quality_cancel_flags: dict = field(default_factory=dict)
     quality_procs:        dict = field(default_factory=dict)
@@ -177,7 +172,6 @@ class Task:
     encode_done_flags:    dict = field(default_factory=dict)
     encoded_files:        dict = field(default_factory=dict)
 
-    # User-input futures
     src_future:      Optional[asyncio.Future] = None
     cut_future:      Optional[asyncio.Future] = None
     subtitle_future: Optional[asyncio.Future] = None
@@ -188,7 +182,6 @@ class Task:
     status_msg:  Optional[object] = None
     started_at:  float = field(default_factory=time.time)
 
-# Global registry keyed by chat_id
 active_tasks: dict[int, Task] = {}
 
 def new_task(mode: Mode, chat_id: int, user_id: int) -> Task:
@@ -206,7 +199,6 @@ def new_task(mode: Mode, chat_id: int, user_id: int) -> Task:
     return t
 
 def cleanup_task(t: Task):
-    # Only pop from active_tasks if this specific task is still the one locked to the chat
     if active_tasks.get(t.chat_id) is t:
         active_tasks.pop(t.chat_id, None)
     if t.work_dir and t.work_dir.exists():
@@ -302,13 +294,11 @@ def confirm_kb(task_id: str) -> InlineKeyboardMarkup:
 
 async def safe_edit(msg, text: str, markup=None):
     try: await msg.edit_text(text, reply_markup=markup)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
+    except FloodWait as e: await asyncio.sleep(e.value)
     except Exception: pass
 
 def push(msg, text: str, markup=None):
-    if EVENT_LOOP and msg:
-        asyncio.run_coroutine_threadsafe(safe_edit(msg, text, markup), EVENT_LOOP)
+    if EVENT_LOOP and msg: asyncio.run_coroutine_threadsafe(safe_edit(msg, text, markup), EVENT_LOOP)
 
 def channel_map() -> dict[str, int]:
     r = {}
@@ -326,13 +316,7 @@ def resolve_channel(series: str) -> Optional[int]:
         if kw in sl or sl in kw: return cid
     return None
 
-# ── PYROGRAM CLIENT ───────────────────────────────────────────────────────────
-app = Client(
-    "friction_combined",
-    api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-    max_concurrent_transmissions=8,
-    in_memory=True,
-)
+app = Client("friction_combined", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, max_concurrent_transmissions=8, in_memory=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OCR ENGINE
@@ -342,8 +326,7 @@ def _load_ocr(gpu_id: int = 0):
         from paddleocr import PaddleOCR
         try:
             import paddle
-            if paddle.device.is_compiled_with_cuda():
-                paddle.device.set_device(f"gpu:{gpu_id}")
+            if paddle.device.is_compiled_with_cuda(): paddle.device.set_device(f"gpu:{gpu_id}")
             _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=True, gpu_id=gpu_id, show_log=False)
             log.info(f"PaddleOCR ready on GPU:{gpu_id}")
         except Exception as e:
@@ -388,7 +371,6 @@ def _norm_ocr_key(txt: str) -> str:
     return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
 def suppress_static_overlay_cues(subs: list, frame_w: int, frame_h: int, total_dur: float) -> list:
-    # Simplified suppression wrapper
     if not subs: return []
     kept = sorted(subs, key=lambda x: x["start"])
     return kept
@@ -405,7 +387,7 @@ def _read_exact(pipe, size):
         to_read -= n
     return bytes(buf)
 
-def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_fps, time_offset, cancel_check, is_target_res=False, progress_cb=None):
+def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_fps, time_offset, cancel_check, progress_cb=None):
     cues    = []
     frame_q = queue.Queue(maxsize=128)
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
@@ -443,46 +425,31 @@ def _process_frame_stream(engine, cmd, bytes_per_frame, crop_h, crop_w, extract_
             try:
                 result = engine.ocr(frame, cls=False)
             except Exception as e:
-                # Do NOT silently swallow errors anymore
                 log.error(f"OCR Inference Error at frame {frame_idx}: {e}")
                 result = None
 
             if result and result[0]:
-                img_w = frame.shape[1]
-                if is_target_res:
-                    lines = [ln for ln in result[0] if ln[1][1] >= 0.25]
-                else:
-                    l, r = img_w * 0.10, img_w * 0.80
-                    lines = [
-                        ln for ln in result[0]
-                        if ln[1][1] >= 0.25
-                        and l <= sum(p[0] for p in ln[0]) / 4 <= r
-                    ]
-                    
-                for ln in lines:
+                for ln in result[0]:
                     raw_text = ln[1][0].strip()
                     cmp_text = _norm_ocr_key(raw_text)
-                    if len(cmp_text) >= 1:
-                        xs = [p[0] for p in ln[0]]
-                        ys = [p[1] for p in ln[0]]
-                        
-                        x_center = sum(xs) / len(xs)
-                        y_center = sum(ys) / len(ys)
-                        box_w = max(xs) - min(xs)
-                        box_h = max(ys) - min(ys)
-                        
+                    
+                    # Logic Fix: Removed the restrictive X-axis bounds that was skipping subtitle text. 
+                    # If PaddleOCR finds text with confidence > 25% anywhere in the 22% crop, it gets caught.
+                    if len(cmp_text) >= 1 and ln[1][1] >= 0.25:
+                        xs = [p[0] for p in ln[0]]; ys = [p[1] for p in ln[0]]
                         cues.append({
-                            "start": cur_t,
-                            "end":   round(cur_t + frame_dur, 3),
-                            "text":  raw_text,
-                            "cmp":   cmp_text,
-                            "x":     float(x_center),
-                            "y":     float(y_center),
-                            "bw":    float(box_w),
-                            "bh":    float(box_h),
+                            "start": cur_t, "end": round(cur_t + frame_dur, 3),
+                            "text": raw_text, "cmp": cmp_text,
+                            "x": sum(xs)/len(xs), "y": sum(ys)/len(ys),
+                            "bw": max(xs)-min(xs), "bh": max(ys)-min(ys),
                         })
 
     process.stdout.close(); process.wait()
+    
+    # Catch mid-stream crashes if FFmpeg abruptly dies
+    if process.returncode != 0 and not cancel_check():
+        log.error("FFmpeg exited abnormally. Subtitles from the remaining video may be missing.")
+        
     return cues
 
 def get_real_duration(path: str) -> float:
@@ -513,9 +480,9 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
     t0 = time.time()
 
     def make_cmd(ss, dur, vf, thr="4"):
-        # Removed -hwaccel cuda for 100% stable raw frame piping
         return [
             "ffmpeg", "-v", "error", "-y", "-threads", thr,
+            "-err_detect", "ignore_err", # Fix: Forces FFmpeg to push through corrupted intro sequence timestamps
             "-ss", str(ss), "-i", video_path, "-t", str(dur),
             "-vf", vf, "-r", str(extract_fps),
             "-f", "image2pipe", "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
@@ -540,7 +507,7 @@ def run_ocr_pipeline(video_path, status_msg, chat_id, start_sec=0.0, end_sec=Non
                 last_ui[0] = time.time()
                 push(status_msg, pb_frames("Direct Stream OCR", fi, total_frames, t0, f"💬 Cues: {len(cl)}"), CANCEL_BTN)
 
-        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, False, _progress)
+        raw = _process_frame_stream(engine, make_cmd(start_sec, proc_dur, vf), bpf, crop_h, crop_w, extract_fps, start_sec, cancel_check, _progress)
         raw = stitch_continuous_lines(raw)
         return suppress_static_overlay_cues(raw, crop_w, crop_h, proc_dur)
 
