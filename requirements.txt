@@ -1,32 +1,65 @@
-# Core Bot & Async
-pyrogram
-tgcrypto
-nest_asyncio
+# ══════════════════════════════════════════════════════════════════════════════
+#  TheFrictionRealm — Lightning AI Pipeline Requirements
+#  GPU : RTX 6000 Ada  |  CUDA 12.x  |  Python 3.12
+#
+#  Install order matters — run these BEFORE pip install:
+#    apt-get install -y ffmpeg aria2 libgl1
+#
+#  Then:
+#    pip install -r requirements.txt
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Video & Downloads
-yt-dlp
-requests
+# ── Telegram bot ──────────────────────────────────────────────────────────────
+pyrogram==2.0.106
+tgcrypto                    # mandatory C extension for Pyrogram MTProto crypto
 
-# AI & Translation
-openai
+# ── Async HTTP (stream server) ────────────────────────────────────────────────
+aiohttp>=3.9.0
 
-# Computer Vision & OCR (Version Locked for Stability)
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
-opencv-contrib-python==4.9.0.80
-paddlepaddle-gpu==2.6.1
-paddleocr==2.8.1
-albumentations==1.4.0
+# ── Video download ────────────────────────────────────────────────────────────
+yt-dlp>=2024.1.0            # keep updated — streaming sites change constantly
 
-# PaddleOCR Dependencies (Version Locked to prevent breaking changes)
-matplotlib<3.9.0
-contourpy<1.2.1
-shapely<2.0.4
-pandas<2.2.0
-scipy<1.13.0
-scikit-image<0.23.0
-Pillow<11.0.0
+# ── HTTP parallel downloader ──────────────────────────────────────────────────
+requests>=2.31.0
 
-# Utilities
-thefuzz
-aiohttp
+# ── Computer vision (frame reading / debug frame saving) ─────────────────────
+opencv-python-headless>=4.9.0   # headless = no GUI deps, works on Lightning AI
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy>=1.26.0,<2.0.0        # pin below 2.x — PaddlePaddle 2.6 needs numpy 1.x
+
+# ── PaddlePaddle GPU  (CUDA 12.0 build — matches Lightning AI default CUDA) ──
+# If you see "CUDA not compiled" run:
+#   pip install paddlepaddle-gpu==2.6.1.post120 -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+paddlepaddle-gpu==2.6.1.post120
+
+# ── PaddleOCR ─────────────────────────────────────────────────────────────────
+paddleocr>=2.7.3
+
+# ── OpenAI (ChatGPT translation — optional but recommended) ───────────────────
+openai>=1.30.0
+
+# ── Asyncio compatibility (no-op outside Jupyter, harmless to include) ────────
+nest-asyncio>=1.6.0
+
+# ── Fuzzy text matching (used by subtitle stitcher) ───────────────────────────
+# (difflib is stdlib but thefuzz gives better ratio for CJK)
+# thefuzz[speedup]          # optional, not currently imported — uncomment if needed
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  System packages  (NOT pip — install via apt before pip)
+#
+#    sudo apt-get update && sudo apt-get install -y \
+#        ffmpeg \        ← must be compiled WITH --enable-nvenc for hevc_nvenc
+#        aria2 \         ← yt-dlp uses aria2c for 16-thread downloads
+#        libgl1 \        ← OpenCV headless still needs libGL at runtime
+#        libglib2.0-0    ← also needed by OpenCV on some Lightning images
+#
+#  Verify NVENC is available:
+#    ffmpeg -encoders 2>/dev/null | grep nvenc
+#  Should show: hevc_nvenc, h264_nvenc, av1_nvenc
+#
+#  Verify PaddlePaddle sees the GPU:
+#    python -c "import paddle; print(paddle.device.cuda.device_count())"
+#  Should print: 1
+# ══════════════════════════════════════════════════════════════════════════════
