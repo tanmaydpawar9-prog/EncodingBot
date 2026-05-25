@@ -1474,7 +1474,7 @@ async def quality_worker(task: Task, spec: QualitySpec,
         task.encode_done_flags[label].set(); return
 
     if err_str:
-    log.error(f"[{label}] encode error: {err_str[:200]}")
+      log.error(f"[{label}] encode error: {err_str[:200]}")
     try: 
         # Removed the triple backticks from the string to prevent UI parsing bugs
         await prog_msg.edit(
