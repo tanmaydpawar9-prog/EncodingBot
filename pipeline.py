@@ -564,6 +564,109 @@ def suppress_static_overlay_cues(subs: list, fw: int, fh: int, dur: float) -> li
     return kept
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Frame pre-processing helpers — make hardsubs detectable on complex artwork
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _preprocess_hardsub(frame: np.ndarray) -> np.ndarray:
+    """
+    Return an OCR-friendly version of the frame.
+
+    Anime hardsubs are almost always white (or light-coloured) with a dark
+    outline.  PaddleOCR's DB++ detector was trained on natural-scene / document
+    text and gets confused by the complex illustrated backgrounds in donghua.
+
+    Strategy:
+      1. Detect bright (subtitle-white) pixels via HSV threshold.
+      2. Dilate the mask to also capture the dark outline immediately around them.
+      3. Build a new frame: uniform dark-grey background + original pixels where
+         the dilated mask fires.
+    Result: text on a plain background — exactly what DB++ expects.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # White / light-coloured text: high Value, low-to-mid Saturation
+    mask_white = cv2.inRange(hsv,
+                             np.array([0,   0, 190], dtype=np.uint8),
+                             np.array([180, 60, 255], dtype=np.uint8))
+
+    # Also catch light-yellow or light-cyan subtitle variants
+    mask_light = cv2.inRange(hsv,
+                             np.array([0,   0, 170], dtype=np.uint8),
+                             np.array([180, 80, 255], dtype=np.uint8))
+
+    mask = cv2.bitwise_or(mask_white, mask_light)
+
+    # Dilate aggressively so the dark outline pixels are included
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask   = cv2.dilate(mask, kernel, iterations=3)
+
+    # Build output: dark background, original pixels where mask fires
+    out = np.full_like(frame, 35)   # very dark grey background
+    out[mask > 0] = frame[mask > 0]
+    return out
+
+
+def _ocr_with_fallbacks(engine, frame: np.ndarray,
+                         frame_h: int, frame_w: int) -> list:
+    """
+    Run PaddleOCR with three escalating strategies and merge all hits.
+
+    Pass 1 — raw frame (BGR, full frame)
+    Pass 2 — preprocessed frame (bright-on-dark, full frame)
+    Pass 3 — bottom 32% crop of raw frame (guaranteed subtitle zone)
+
+    Coordinates from the crop are offset back to full-frame space.
+    All results are de-duplicated by bounding-box overlap.
+    """
+    all_lines: list = []
+
+    def _run(img, y_offset: int = 0):
+        try:
+            res = engine.ocr(img, cls=False)
+        except Exception as e:
+            log.debug(f"OCR pass error: {e}")
+            return
+        if not (res and res[0]):
+            return
+        for ln in res[0]:
+            if ln[1][1] < 0.10:   # very low confidence floor — filter later
+                continue
+            pts = ln[0]
+            # Apply y_offset for crops
+            if y_offset:
+                pts = [[p[0], p[1] + y_offset] for p in pts]
+            all_lines.append((pts, ln[1]))
+
+    # ── Pass 1: raw BGR ───────────────────────────────────────────────────────
+    _run(frame)
+
+    # ── Pass 2: preprocessed (bright-on-dark) ─────────────────────────────────
+    preprocessed = _preprocess_hardsub(frame)
+    _run(preprocessed)
+
+    # ── Pass 3: bottom 32% crop of raw frame ─────────────────────────────────
+    crop_y = int(frame_h * 0.68)
+    _run(frame[crop_y:], y_offset=crop_y)
+
+    # ── De-duplicate by centre-point proximity (within 30 px) ────────────────
+    unique: list = []
+    for ln in all_lines:
+        pts = ln[0]
+        cx  = sum(p[0] for p in pts) / len(pts)
+        cy  = sum(p[1] for p in pts) / len(pts)
+        dup = False
+        for prev_pts, _ in unique:
+            px  = sum(p[0] for p in prev_pts) / len(prev_pts)
+            py  = sum(p[1] for p in prev_pts) / len(prev_pts)
+            if abs(cx - px) < 30 and abs(cy - py) < 20:
+                dup = True; break
+        if not dup:
+            unique.append(ln)
+
+    return unique
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Frame-stream processor  — FULL FRAME, no band crop
 # ══════════════════════════════════════════════════════════════════════════════
 def _process_frame_stream(engine, cmd: list, bpf: int,
@@ -633,56 +736,45 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
         if mx < 50:
             continue
 
-        # ── OCR ───────────────────────────────────────────────────────────────
-        try:
-            result = engine.ocr(frame, cls=False)
-        except Exception as _oe:
-            _ocr_err_ct[0] += 1
-            if _ocr_err_ct[0] <= 5:   # log first 5 errors, then suppress
-                log.error(f"PaddleOCR exception (frame {idx}, t={cur_t:.2f}s): {_oe}")
-            result = None
-
-        if not (result and result[0]):
-            continue
+        # ── OCR — three passes: raw / preprocessed / bottom-crop ─────────────
+        lines = _ocr_with_fallbacks(engine, frame, frame_h, frame_w)
 
         # ── Log the very first detection ──────────────────────────────────────
-        if _first_cue[0]:
+        if lines and _first_cue[0]:
             _first_cue[0] = False
             log.info(f"🎯 First OCR hit at frame {idx} (t={cur_t:.2f}s) "
-                     f"— {len(result[0])} line(s) detected")
-            # Save annotated version of this frame
+                     f"— {len(lines)} line(s)")
             try:
                 ann = frame.copy()
-                for _ln in result[0]:
-                    _pts = np.array(_ln[0], dtype=np.int32)
-                    cv2.polylines(ann, [_pts], True, (0, 255, 0), 2)
-                    cv2.putText(ann, f"{_ln[1][0][:30]} {_ln[1][1]:.2f}",
-                                tuple(_pts[0].tolist()),
+                for _pts, _rec in lines:
+                    _pa = np.array(_pts, dtype=np.int32)
+                    cv2.polylines(ann, [_pa], True, (0, 255, 0), 2)
+                    cv2.putText(ann, f"{_rec[0][:25]} {_rec[1]:.2f}",
+                                tuple(np.clip(_pa[0], 0,
+                                      [frame_w-1, frame_h-1]).tolist()),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.imwrite(str(_FRAME_DIR / f"FIRST_HIT_frame{idx}.jpg"), ann)
+                cv2.imwrite(str(_FRAME_DIR / f"FIRST_HIT_f{idx}.jpg"), ann)
             except Exception: pass
 
-        for ln in result[0]:
-            conf     = ln[1][1]
-            if conf < 0.15: continue    # lowered from 0.25 to catch faint subs
-            raw_text = ln[1][0].strip()
+        for pts, (raw_text, conf) in lines:
+            if conf < 0.15: continue
+            raw_text = raw_text.strip()
             cmp_text = _norm(raw_text)
             if not cmp_text: continue
 
-            # Save annotated frame for every detected box (capped at 50)
+            # Annotate first 50 cue-frames
             if len(cues) < 50:
                 try:
                     ann2 = frame.copy()
-                    for _ln2 in result[0]:
-                        _pts2 = np.array(_ln2[0], dtype=np.int32)
-                        cv2.polylines(ann2, [_pts2], True, (0, 200, 255), 2)
+                    for _pts2, _ in lines:
+                        _pa2 = np.array(_pts2, dtype=np.int32)
+                        cv2.polylines(ann2, [_pa2], True, (0, 200, 255), 2)
                     cv2.imwrite(
                         str(_FRAME_DIR / f"cue_{len(cues):04d}_f{idx}.jpg"),
                         ann2)
                 except Exception: pass
 
-            pts = ln[0]
-            xs  = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
             cues.append({
                 "start": cur_t,
                 "end":   round(cur_t + frame_dur, 3),
