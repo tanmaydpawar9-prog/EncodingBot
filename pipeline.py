@@ -397,20 +397,36 @@ def _load_ocr(gpu_id: int = 0):
         from paddleocr import PaddleOCR
         try:
             import paddle
-            if paddle.device.is_compiled_with_cuda():
+            on_gpu = paddle.device.is_compiled_with_cuda()
+            if on_gpu:
                 paddle.device.set_device(f"gpu:{gpu_id}")
+            log.info(f"PaddleOCR init — GPU:{gpu_id}  cuda_compiled={on_gpu}")
             _OCR_ENGINES[gpu_id] = PaddleOCR(
-                use_angle_cls=False, lang="ch",
-                use_gpu=True, gpu_id=gpu_id,
-                # RTX 6000 96 GB VRAM — tuned batch sizes (too large causes OOM on init)
-                det_batch_num=16, rec_batch_num=32,
+                use_angle_cls=False,
+                lang="ch",           # detects Chinese + English simultaneously
+                use_gpu=on_gpu,
+                gpu_id=gpu_id,
+                det_batch_num=16,
+                rec_batch_num=32,
+                # ── Hardsub-tuned detection thresholds ───────────────────────
+                # Default det_db_thresh=0.3 misses semi-transparent or
+                # low-contrast hardsub text entirely.  0.15 catches much more.
+                det_db_thresh=0.15,
+                det_db_box_thresh=0.4,   # minimum score for a valid text box
+                det_db_unclip_ratio=2.5, # expand boxes — subtitles are often wider than the text itself
+                det_db_score_mode="slow",# polygon-based scoring (better for styled text)
+                use_dilation=True,       # morphological dilation finds thin subtitle strokes
                 show_log=False,
             )
-            log.info(f"PaddleOCR ready  GPU:{gpu_id}")
+            log.info(f"PaddleOCR ready  GPU:{gpu_id}  (det_thresh=0.15, dilation=True)")
         except Exception as e:
-            log.warning(f"GPU OCR failed ({e}) → CPU fallback")
-            _OCR_ENGINES[gpu_id] = PaddleOCR(
-                use_angle_cls=False, lang="ch", use_gpu=False, show_log=False)
+            log.warning(f"GPU OCR init failed: {e}")
+            log.warning("Falling back to CPU PaddleOCR — OCR will be slower")
+            from paddleocr import PaddleOCR as _P
+            _OCR_ENGINES[gpu_id] = _P(
+                use_angle_cls=False, lang="ch", use_gpu=False,
+                det_db_thresh=0.15, det_db_unclip_ratio=2.5,
+                use_dilation=True, show_log=False)
     return _OCR_ENGINES[gpu_id]
 
 # ── Subtitle stitcher ─────────────────────────────────────────────────────────
@@ -562,6 +578,15 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
     cues: list = []
     fq: queue.Queue = queue.Queue(maxsize=256)
 
+    # ── Debug frame save dir ──────────────────────────────────────────────────
+    _FRAME_DIR = Path("/teamspace/studios/this_studio/EncodingBot/Frames")
+    _FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    _SAVE_EVERY   = 4      # save 1-in-4 frames
+    _MAX_SAVES    = 2000   # hard cap so we don't fill disk
+    _saves_done   = [0]
+    _ocr_err_ct   = [0]
+    _first_cue    = [True]
+
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, bufsize=10**8)
     time.sleep(0.5)
@@ -590,22 +615,71 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
 
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3))
 
-        # Skip near-black / near-white solid frames with no text
+        # ── Save 1-in-4 frames for debug inspection ───────────────────────────
+        if idx % _SAVE_EVERY == 0 and _saves_done[0] < _MAX_SAVES:
+            try:
+                cv2.imwrite(
+                    str(_FRAME_DIR / f"frame_{idx:07d}_t{cur_t:.2f}.jpg"),
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 85],
+                )
+                _saves_done[0] += 1
+            except Exception as _se:
+                log.debug(f"Frame save failed: {_se}")
+
+        # Skip near-black frames (no text possible)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mn, mx = cv2.minMaxLoc(gray)[:2]
-        if mx < 50:   # essentially black — no text possible
+        if mx < 50:
             continue
 
-        try:    result = engine.ocr(frame, cls=False)
-        except: result = None
-        if not (result and result[0]): continue
+        # ── OCR ───────────────────────────────────────────────────────────────
+        try:
+            result = engine.ocr(frame, cls=False)
+        except Exception as _oe:
+            _ocr_err_ct[0] += 1
+            if _ocr_err_ct[0] <= 5:   # log first 5 errors, then suppress
+                log.error(f"PaddleOCR exception (frame {idx}, t={cur_t:.2f}s): {_oe}")
+            result = None
+
+        if not (result and result[0]):
+            continue
+
+        # ── Log the very first detection ──────────────────────────────────────
+        if _first_cue[0]:
+            _first_cue[0] = False
+            log.info(f"🎯 First OCR hit at frame {idx} (t={cur_t:.2f}s) "
+                     f"— {len(result[0])} line(s) detected")
+            # Save annotated version of this frame
+            try:
+                ann = frame.copy()
+                for _ln in result[0]:
+                    _pts = np.array(_ln[0], dtype=np.int32)
+                    cv2.polylines(ann, [_pts], True, (0, 255, 0), 2)
+                    cv2.putText(ann, f"{_ln[1][0][:30]} {_ln[1][1]:.2f}",
+                                tuple(_pts[0].tolist()),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.imwrite(str(_FRAME_DIR / f"FIRST_HIT_frame{idx}.jpg"), ann)
+            except Exception: pass
 
         for ln in result[0]:
-            conf = ln[1][1]
-            if conf < 0.25: continue
+            conf     = ln[1][1]
+            if conf < 0.15: continue    # lowered from 0.25 to catch faint subs
             raw_text = ln[1][0].strip()
             cmp_text = _norm(raw_text)
             if not cmp_text: continue
+
+            # Save annotated frame for every detected box (capped at 50)
+            if len(cues) < 50:
+                try:
+                    ann2 = frame.copy()
+                    for _ln2 in result[0]:
+                        _pts2 = np.array(_ln2[0], dtype=np.int32)
+                        cv2.polylines(ann2, [_pts2], True, (0, 200, 255), 2)
+                    cv2.imwrite(
+                        str(_FRAME_DIR / f"cue_{len(cues):04d}_f{idx}.jpg"),
+                        ann2)
+                except Exception: pass
 
             pts = ln[0]
             xs  = [p[0] for p in pts]; ys = [p[1] for p in pts]
@@ -622,6 +696,9 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
             })
 
     proc.stdout.close(); proc.wait()
+    log.info(f"Frame stream done — {idx+1} frames, {len(cues)} cues, "
+             f"{_ocr_err_ct[0]} OCR errors, {_saves_done[0]} frames saved "
+             f"→ {_FRAME_DIR}")
     return cues
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1548,18 +1625,18 @@ async def cmd_shutdown(c, m: Message):
     deactivate_machine()
 
 # ── Universal message router ──────────────────────────────────────────────────
-# filters.user = only messages from real users (excludes bots, channels, etc.)
-# This prevents the bot from reacting to its own messages or other bots' replies.
+# Bot-message guard is handled inside the function (filters.user is a factory
+# in Pyrogram, not a standalone boolean filter — using it bare with & crashes).
 @app.on_message(
-    filters.all
-    & ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
+    ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
 )
 async def msg_router(c, m: Message):
+    # Ignore messages sent by any bot (including ourselves in group chats)
+    if not m.from_user or m.from_user.is_bot:
+        return
+
     task = active_tasks.get(m.chat.id)
     if not task or task.stage in (Stage.DONE, Stage.CANCELLED): return
-
-    # Extra guard: ignore messages from the bot itself (group chat edge-case)
-    if m.from_user and m.from_user.is_bot: return
 
     s = task.stage
 
