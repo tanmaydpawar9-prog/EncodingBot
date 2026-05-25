@@ -2,7 +2,7 @@
 """
 TheFrictionRealm — Lightning AI Unified Bot v3.0
 GPU  : RTX 6000 Ada (dual NVENC engines, Optical-Flow AQ, 96 GB VRAM)
-OCR  : PaddleOCR full-frame — every pixel, every frame
+OCR  : EasyOCR full-frame (CRAFT detector) — styled text on complex backgrounds
 Subs : Smart position-aware .ASS with ResX/ResY coordinate mapping
 Enc  : hevc_nvenc p7 + multipass fullres + cq19 + aq-strength 15
 
@@ -390,43 +390,36 @@ app = Client(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  OCR engine  — RTX 6000 Ada optimised batch sizes
+#  OCR engine  — EasyOCR (CRAFT) mapped to GPU
 # ══════════════════════════════════════════════════════════════════════════════
 def _load_ocr(gpu_id: int = 0):
     if gpu_id not in _OCR_ENGINES:
-        from paddleocr import PaddleOCR
+        import easyocr
+        import torch
+        
+        device_str = f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
         try:
-            import paddle
-            on_gpu = paddle.device.is_compiled_with_cuda()
-            if on_gpu:
-                paddle.device.set_device(f"gpu:{gpu_id}")
-            log.info(f"PaddleOCR init — GPU:{gpu_id}  cuda_compiled={on_gpu}")
-            _OCR_ENGINES[gpu_id] = PaddleOCR(
-                use_angle_cls=False,
-                lang="ch",           # detects Chinese + English simultaneously
-                use_gpu=on_gpu,
-                gpu_id=gpu_id,
-                det_batch_num=16,
-                rec_batch_num=32,
-                # ── Hardsub-tuned detection thresholds ───────────────────────
-                # Default det_db_thresh=0.3 misses semi-transparent or
-                # low-contrast hardsub text entirely.  0.15 catches much more.
-                det_db_thresh=0.15,
-                det_db_box_thresh=0.4,   # minimum score for a valid text box
-                det_db_unclip_ratio=2.5, # expand boxes — subtitles are often wider than the text itself
-                det_db_score_mode="slow",# polygon-based scoring (better for styled text)
-                use_dilation=True,       # morphological dilation finds thin subtitle strokes
-                show_log=False,
+            log.info(f"EasyOCR init — GPU:{gpu_id} ({device_str})")
+            # EasyOCR uses CRAFT (Character Region Awareness for Text detection)
+            # Highly robust against complex anime background styling.
+            reader = easyocr.Reader(
+                ['ch_sim', 'en'], 
+                gpu=torch.cuda.is_available(),
+                quantize=False  # Better accuracy, relies on RTX 6000's massive VRAM
             )
-            log.info(f"PaddleOCR ready  GPU:{gpu_id}  (det_thresh=0.15, dilation=True)")
+            
+            # Pin to specific device if multithreading across dual-GPUs
+            if torch.cuda.is_available():
+                reader.device = device_str
+                
+            _OCR_ENGINES[gpu_id] = reader
+            log.info(f"EasyOCR ready GPU:{gpu_id}")
+            
         except Exception as e:
             log.warning(f"GPU OCR init failed: {e}")
-            log.warning("Falling back to CPU PaddleOCR — OCR will be slower")
-            from paddleocr import PaddleOCR as _P
-            _OCR_ENGINES[gpu_id] = _P(
-                use_angle_cls=False, lang="ch", use_gpu=False,
-                det_db_thresh=0.15, det_db_unclip_ratio=2.5,
-                use_dilation=True, show_log=False)
+            log.warning("Falling back to CPU EasyOCR")
+            _OCR_ENGINES[gpu_id] = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+            
     return _OCR_ENGINES[gpu_id]
 
 # ── Subtitle stitcher ─────────────────────────────────────────────────────────
@@ -466,12 +459,7 @@ def stitch_full_frame(subs: list, frame_w: int = 1920, frame_h: int = 1080,
                        max_gap: float = 0.15) -> list:
     """
     Full-frame OCR stitch — groups cues by screen position FIRST so that
-    interleaved cues from different regions (e.g. dialogue at the bottom while
-    a skill name floats in the centre) do NOT block each other from stitching.
-
-    1. Assign each cue to a (bx, by) spatial bucket (~10x12 grid).
-    2. Sort + stitch within each bucket independently.
-    3. Flatten, sort by start time, return.
+    interleaved cues from different regions do NOT block each other.
     """
     if not subs: return []
     bin_x = max(frame_w // 10, 80)
@@ -490,31 +478,20 @@ def stitch_full_frame(subs: list, frame_w: int = 1920, frame_h: int = 1080,
 
 # ── Watermark / static overlay suppressor ────────────────────────────────────
 _WM_BIN   = 0.08
-_WM_SPAN  = 0.55    # must span >55% of duration — very persistent to count as watermark
-_WM_COUNT = 18      # must appear 18+ times — harder threshold
-_WM_MRG_X = 0.20   # left/right edge strip
-_WM_MRG_Y = 0.15   # top/bottom edge strip (tightened from 0.20)
+_WM_SPAN  = 0.55    
+_WM_COUNT = 18      
+_WM_MRG_X = 0.20   
+_WM_MRG_Y = 0.15   
 _WM_SIM   = 0.85
 
 def _norm(txt: str) -> str:
     return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
 def _is_corner(x: float, y: float, fw: int, fh: int) -> bool:
-    """
-    Returns True only for genuine watermark/logo zones near frame edges.
-
-    CRITICAL: The bottom-centre subtitle zone (bottom 35%, centre 70%) is
-    explicitly protected — real hardsub dialogue lives here and must NEVER
-    be treated as a watermark no matter how often it appears.
-    """
-    # ── Protected subtitle zone ───────────────────────────────────────────────
-    # Bottom 35% of frame, horizontal centre 70%  → always safe, never a watermark
     if (fw * 0.15 <= x <= fw * 0.85) and (y >= fh * 0.65):
         return False
-    # Top-centre title zone (episode cards, OP/ED title) — also protect
     if (fw * 0.20 <= x <= fw * 0.80) and (y <= fh * 0.30):
         return False
-    # Anything else near the very edges counts as a potential watermark
     return (x <= fw * _WM_MRG_X or x >= fw * (1 - _WM_MRG_X) or
             y <= fh * _WM_MRG_Y or y >= fh * (1 - _WM_MRG_Y))
 
@@ -557,51 +534,36 @@ def suppress_static_overlay_cues(subs: list, fw: int, fh: int, dur: float) -> li
         is_wm = (n >= _WM_COUNT
                  and cl["max_e"] - cl["min_s"] >= min_span
                  and _is_corner(ax, ay, fw, fh)
-                 and avg_area <= 0.015     # watermarks are tiny relative to full frame
-                 and 1 <= len(cl["canon"]) <= 20)  # short fixed text = logo
+                 and avg_area <= 0.015     
+                 and 1 <= len(cl["canon"]) <= 20)  
         if not is_wm: kept.extend(cl["items"])
     kept.sort(key=lambda x: x["start"])
     return kept
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Frame pre-processing helpers — make hardsubs detectable on complex artwork
+#  Frame pre-processing helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _preprocess_hardsub(frame: np.ndarray) -> np.ndarray:
     """
     Return an OCR-friendly version of the frame.
-
-    Anime hardsubs are almost always white (or light-coloured) with a dark
-    outline.  PaddleOCR's DB++ detector was trained on natural-scene / document
-    text and gets confused by the complex illustrated backgrounds in donghua.
-
-    Strategy:
-      1. Detect bright (subtitle-white) pixels via HSV threshold.
-      2. Dilate the mask to also capture the dark outline immediately around them.
-      3. Build a new frame: uniform dark-grey background + original pixels where
-         the dilated mask fires.
-    Result: text on a plain background — exactly what DB++ expects.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # White / light-coloured text: high Value, low-to-mid Saturation
     mask_white = cv2.inRange(hsv,
                              np.array([0,   0, 190], dtype=np.uint8),
                              np.array([180, 60, 255], dtype=np.uint8))
 
-    # Also catch light-yellow or light-cyan subtitle variants
     mask_light = cv2.inRange(hsv,
                              np.array([0,   0, 170], dtype=np.uint8),
                              np.array([180, 80, 255], dtype=np.uint8))
 
     mask = cv2.bitwise_or(mask_white, mask_light)
 
-    # Dilate aggressively so the dark outline pixels are included
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     mask   = cv2.dilate(mask, kernel, iterations=3)
 
-    # Build output: dark background, original pixels where mask fires
-    out = np.full_like(frame, 35)   # very dark grey background
+    out = np.full_like(frame, 35) 
     out[mask > 0] = frame[mask > 0]
     return out
 
@@ -609,35 +571,35 @@ def _preprocess_hardsub(frame: np.ndarray) -> np.ndarray:
 def _ocr_with_fallbacks(engine, frame: np.ndarray,
                          frame_h: int, frame_w: int) -> list:
     """
-    Run PaddleOCR with three escalating strategies and merge all hits.
-
-    Pass 1 — raw frame (BGR, full frame)
-    Pass 2 — preprocessed frame (bright-on-dark, full frame)
-    Pass 3 — bottom 32% crop of raw frame (guaranteed subtitle zone)
-
-    Coordinates from the crop are offset back to full-frame space.
-    All results are de-duplicated by bounding-box overlap.
+    Run EasyOCR with three escalating strategies and merge all hits.
+    Forces BGR -> RGB to prevent silent channel-swap dropping.
     """
     all_lines: list = []
 
     def _run(img, y_offset: int = 0):
+        # ── CRITICAL: BGR to RGB conversion for EasyOCR ──
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
         try:
-            res = engine.ocr(img, cls=False)
+            # detail=1 returns bounding boxes, text, and confidence
+            res = engine.readtext(img_rgb, paragraph=False)
         except Exception as e:
             log.debug(f"OCR pass error: {e}")
             return
-        if not (res and res[0]):
+            
+        if not res:
             return
-        for ln in res[0]:
-            if ln[1][1] < 0.10:   # very low confidence floor — filter later
+            
+        for ln in res:
+            pts, text, conf = ln[0], ln[1], ln[2]
+            if conf < 0.10: 
                 continue
-            pts = ln[0]
-            # Apply y_offset for crops
+                
             if y_offset:
                 pts = [[p[0], p[1] + y_offset] for p in pts]
-            all_lines.append((pts, ln[1]))
+            all_lines.append((pts, (text, conf)))
 
-    # ── Pass 1: raw BGR ───────────────────────────────────────────────────────
+    # ── Pass 1: raw ───────────────────────────────────────────────────────
     _run(frame)
 
     # ── Pass 2: preprocessed (bright-on-dark) ─────────────────────────────────
@@ -667,25 +629,19 @@ def _ocr_with_fallbacks(engine, frame: np.ndarray,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Frame-stream processor  — FULL FRAME, no band crop
+#  Frame-stream processor
 # ══════════════════════════════════════════════════════════════════════════════
 def _process_frame_stream(engine, cmd: list, bpf: int,
                            frame_h: int, frame_w: int,
                            extract_fps: float, time_offset: float,
                            cancel_check, progress_cb=None) -> list:
-    """
-    Producer-consumer OCR pipeline.
-    Reads raw BGR frames from FFmpeg stdout, runs PaddleOCR on each,
-    and returns a list of cue dicts with text, timestamps, and screen coordinates.
-    """
     cues: list = []
     fq: queue.Queue = queue.Queue(maxsize=256)
 
-    # ── Debug frame save dir ──────────────────────────────────────────────────
     _FRAME_DIR = Path("/teamspace/studios/this_studio/EncodingBot/Frames")
     _FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    _SAVE_EVERY   = 4      # save 1-in-4 frames
-    _MAX_SAVES    = 2000   # hard cap so we don't fill disk
+    _SAVE_EVERY   = 4      
+    _MAX_SAVES    = 2000   
     _saves_done   = [0]
     _ocr_err_ct   = [0]
     _first_cue    = [True]
@@ -718,7 +674,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
 
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3))
 
-        # ── Save 1-in-4 frames for debug inspection ───────────────────────────
         if idx % _SAVE_EVERY == 0 and _saves_done[0] < _MAX_SAVES:
             try:
                 cv2.imwrite(
@@ -730,16 +685,13 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
             except Exception as _se:
                 log.debug(f"Frame save failed: {_se}")
 
-        # Skip near-black frames (no text possible)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mn, mx = cv2.minMaxLoc(gray)[:2]
         if mx < 50:
             continue
 
-        # ── OCR — three passes: raw / preprocessed / bottom-crop ─────────────
         lines = _ocr_with_fallbacks(engine, frame, frame_h, frame_w)
 
-        # ── Log the very first detection ──────────────────────────────────────
         if lines and _first_cue[0]:
             _first_cue[0] = False
             log.info(f"🎯 First OCR hit at frame {idx} (t={cur_t:.2f}s) "
@@ -762,7 +714,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
             cmp_text = _norm(raw_text)
             if not cmp_text: continue
 
-            # Annotate first 50 cue-frames
             if len(cues) < 50:
                 try:
                     ann2 = frame.copy()
@@ -807,10 +758,6 @@ def get_real_duration(path: str) -> float:
 def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
                      start_sec: float = 0.0, end_sec: float = None,
                      cancel_check=None) -> tuple:
-    """
-    Returns (subs, frame_w, frame_h).
-    Scans EVERY FRAME of the full picture — RTX 6000 handles it easily.
-    """
     if cancel_check is None: cancel_check = lambda: False
 
     cap    = cv2.VideoCapture(video_path)
@@ -824,13 +771,10 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     end_sec   = min(end_sec if end_sec is not None else duration, duration)
     proc_dur  = end_sec - start_sec
 
-    # Scale: keep native resolution up to 1920 wide for OCR
-    # RTX 6000 has 96 GB VRAM — no need to downscale aggressively
     scale = min(1920, orig_w) / max(orig_w, 1)
-    s_w   = (int(orig_w * scale) >> 1) << 1   # even
+    s_w   = (int(orig_w * scale) >> 1) << 1   
     s_h   = (int(orig_h * scale) >> 1) << 1
 
-    # FULL FRAME — no crop, geometry locked by make_cmd
     bpf   = s_w * s_h * 3
 
     total_frames = int(proc_dur * fps)
@@ -842,13 +786,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
          CANCEL_BTN)
 
     def make_cmd(ss: float, dur: float, thr: str = "4") -> list:
-        """
-        FFmpeg rawvideo pipe for OCR frame extraction.
-        NO -hwaccel cuda: CUDA decode keeps frames in GPU memory; piping to
-        rawvideo requires an implicit hwdownload that silently drops or corrupts
-        frames on some driver versions.  CPU decode is fast enough here.
-        -r and -s are explicit so every read is exactly bpf bytes.
-        """
         return [
             "ffmpeg", "-v", "error", "-y",
             "-threads", thr,
@@ -862,7 +799,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
             "-",
         ]
 
-    # ── Pipe self-test: decode 1 frame and verify geometry ────────────────────
     _test_cmd = make_cmd(start_sec, min(2.0, proc_dur))
     _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, bufsize=bpf * 4)
@@ -878,7 +814,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     log.info(f"OCR pipe self-test OK — {s_w}×{s_h} bgr24, bpf={bpf:,}")
 
     if NUM_GPUS >= 2:
-        # Dual-GPU split (future-proof for dual-GPU Lightning setups)
         mid, ov = proc_dur / 2.0, 2.0
         e0, e1  = _load_ocr(0), _load_ocr(1)
         seg     = [[], []]
@@ -920,7 +855,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
                      [s for s in seg[1] if s["start"] >= mid_abs],
                      key=lambda x: x["start"])
     else:
-        # Single RTX 6000 — full throughput
         engine  = _load_ocr(0)
         last_ui = [time.time()]
 
@@ -988,10 +922,9 @@ async def batch_translate(zh_texts: list, status_msg=None, chat_id: int = None) 
     return res
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Smart ASS subtitle writer  — position-aware, ResX/ResY mapped
+#  Smart ASS subtitle writer
 # ══════════════════════════════════════════════════════════════════════════════
 def ass_ts(sec: float) -> str:
-    """Convert seconds to ASS timestamp H:MM:SS.cc"""
     cc = int(round(sec * 100))
     h  = cc // 360000; cc %= 360000
     m  = cc //   6000; cc %=   6000
@@ -999,52 +932,36 @@ def ass_ts(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cc:02d}"
 
 def _ass_escape(text: str) -> str:
-    """Escape ASS special characters in subtitle text."""
     return text.replace("\\", "\u2060").replace("{", r"\{").replace("}", r"\}")
 
-# Region classification thresholds (fraction of frame height)
-_REGION_BOTTOM = 0.75   # y > 75%  → normal bottom subtitle
-_REGION_TOP    = 0.22   # y < 22%  → top title / episode card
-# Between 22–75% → "middle" (special moves, skill names, battle text)
+_REGION_BOTTOM = 0.75   
+_REGION_TOP    = 0.22   
 
-# Style selector based on position + text size
 def _pick_style(sub: dict, frame_w: int, frame_h: int) -> str:
     y_r  = sub.get("y", frame_h * 0.9) / max(frame_h, 1)
     bh_r = sub.get("bh", 0)            / max(frame_h, 1)
     if   y_r  > _REGION_BOTTOM: return "Default"
     elif y_r  < _REGION_TOP:    return "TopTitle"
-    elif bh_r > 0.055:          return "MoveName"   # large text = special move/skill
-    else:                       return "Overlay"     # mid-frame regular text
+    elif bh_r > 0.055:          return "MoveName"   
+    else:                       return "Overlay"     
 
 def write_smart_ass(subs: list, en_texts: list, path: str,
                     frame_w: int, frame_h: int) -> None:
-    """
-    Write a smart position-aware .ASS file.
-
-    Layout rules:
-      Default   — bottom subtitle: Chinese line + English line stacked (\\N)
-      TopTitle  — top card: Chinese + English stacked
-      MoveName  — special move / skill: Chinese at detected pos (cyan/bold),
-                  English positioned just below using ResX/ResY coords
-      Overlay   — mid-screen battle text: same positioned layout, smaller font
-    """
     play_x = frame_w
     play_y = frame_h
 
-    # Font sizes scale with PlayResY (calibrated for 1080p)
-    fs_default   = int(play_y * 0.048)   # ≈52 @ 1080p
-    fs_movename  = int(play_y * 0.058)   # ≈63 @ 1080p
-    fs_overlay   = int(play_y * 0.040)   # ≈43 @ 1080p
-    fs_toptitle  = int(play_y * 0.044)   # ≈48 @ 1080p
-    fs_trans     = int(play_y * 0.034)   # ≈37 @ 1080p
-    margin_bot   = int(play_y * 0.055)   # bottom margin
-    margin_top   = int(play_y * 0.038)   # top margin
+    fs_default   = int(play_y * 0.048)   
+    fs_movename  = int(play_y * 0.058)   
+    fs_overlay   = int(play_y * 0.040)   
+    fs_toptitle  = int(play_y * 0.044)   
+    fs_trans     = int(play_y * 0.034)   
+    margin_bot   = int(play_y * 0.055)   
+    margin_top   = int(play_y * 0.038)   
 
-    # Colour format: &HAABBGGRR  (A=0 = opaque)
     WHITE    = "&H00FFFFFF"
-    CYAN     = "&H00FFFF00"   # gold-ish cyan for skill names
-    YELLOW   = "&H0000FFFF"   # bright yellow for overlay text
-    LTGREY   = "&H00D0D0D0"   # translation
+    CYAN     = "&H00FFFF00"   
+    YELLOW   = "&H0000FFFF"   
+    LTGREY   = "&H00D0D0D0"   
     BLACK    = "&H00000000"
     OUTLINE  = "&H00080808"
     SHADOW   = "&H80000000"
@@ -1086,7 +1003,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         has_en = bool(en_clean)
 
         if style in ("Default", "TopTitle"):
-            # Stacked: Chinese \N English (both in one event — always in sync)
             if has_en:
                 text = f"{zh}\\N{{\\rTranslation}}{en_clean}"
             else:
@@ -1096,14 +1012,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"Dialogue: 0,{ts_s},{ts_e},{style},,80,80,{mrg},,{text}")
 
         else:
-            # Positioned: Chinese at detected screen coords
-            # English placed directly below the Chinese bounding box
-            #
-            # \an5 = center-aligned anchor at (x, y)
-            en_y = y + (bh * 0.55) + int(play_y * 0.036)  # just below the Chinese box
+            en_y = y + (bh * 0.55) + int(play_y * 0.036)  
 
             zh_tag = f"{{\\an5\\pos({x:.0f},{y:.0f})}}"
-            en_tag = f"{{\\an8\\pos({x:.0f},{en_y:.0f})}}"   # \an8 = top-centre anchor
+            en_tag = f"{{\\an8\\pos({x:.0f},{en_y:.0f})}}"   
 
             events.append(
                 f"Dialogue: 0,{ts_s},{ts_e},{style},,0,0,0,,{zh_tag}{zh}")
@@ -1116,7 +1028,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for ev in events:
             f.write(ev + "\n")
 
-# ── Legacy SRT writer (kept for the "send raw OCR" step) ─────────────────────
+# ── Legacy SRT writer ─────────────────────
 def srt_ts(sec: float) -> str:
     ms = int(round((sec % 1) * 1000))
     if ms >= 1000: sec += 1; ms = 0
@@ -1374,16 +1286,6 @@ async def mux_video(task: Task, sub_path: Path, out_path: Path) -> Path:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Encode  — hevc_nvenc, RTX 6000 Ada fully optimized
-#
-#  Key settings:
-#    p7           — highest NVENC quality preset  (RTX 6000 handles it fast)
-#    multipass fullres — 2-pass full-resolution (like x265 CRF but on GPU)
-#    cq 19        — perceptual quality target (lower = better, 0-51)
-#    aq-strength 15  — strong adaptive quantization for animation flat areas
-#    rc-lookahead 50 — 50-frame lookahead for better VBR rate control
-#    weighted_pred 1 — better fades / cross-dissolves
-#    refs 4       — 4 reference frames (max for HEVC on NVENC)
-#    temporal-aq  — uses RTX 6000's optical-flow engine
 # ══════════════════════════════════════════════════════════════════════════════
 def out_filename(base: str, quality: str) -> str:
     return f"{base} [{quality}][{UPLOAD_TAG}].mkv"
@@ -1391,10 +1293,9 @@ def out_filename(base: str, quality: str) -> str:
 def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
                      output_name: str, src_bitrate: int,
                      audio_idx: str = "a:0", has_subs: bool = True) -> list:
-    # Adaptive maxrate ceiling — tighter than before for better avg quality
     scale_factors = {"2K": 0.65, "1080p": 0.45, "720p": 0.30}
     maxrate = max(int(src_bitrate * scale_factors.get(spec.label, 0.45) * 1.4), 500_000)
-    bufsize = int(maxrate * 2.5)   # large buffer gives VBR room to breathe
+    bufsize = int(maxrate * 2.5)   
 
     return [
         "ffmpeg", "-y",
@@ -1404,38 +1305,32 @@ def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
         "-map", f"0:{audio_idx}",
         *([ "-map", "0:s"] if has_subs else []),
 
-        # GPU scaling — Lanczos stays sharpest for animation cel lines
         "-vf", f"scale_cuda={spec.width}:-2:interp_algo=lanczos:format=nv12",
 
-        # Encoder
         "-c:v", "hevc_nvenc",
-        "-preset",    "p7",           # highest quality NVENC preset
+        "-preset",    "p7",           
         "-tune",      "hq",
         "-profile:v", "main",
         "-level",     "auto",
 
-        # Rate control — quality-based VBR (modern replacement for vbr_hq)
         "-rc",         "vbr",
-        "-multipass",  "fullres",     # full-resolution 2-pass (best NVENC quality)
-        "-cq",         "19",          # CRF-equivalent quality target
-        "-b:v",        "0",           # let CQ drive bitrate; maxrate is ceiling
+        "-multipass",  "fullres",     
+        "-cq",         "19",          
+        "-b:v",        "0",           
         "-maxrate:v",  str(maxrate),
         "-bufsize:v",  str(bufsize),
-        "-gpu",        "0",           # always GPU 0 (single RTX 6000)
+        "-gpu",        "0",           
 
-        # Perceptual quality — critical for animation
         "-spatial-aq",  "1",
-        "-temporal-aq", "1",          # RTX 6000 Ada optical-flow AQ
-        "-aq-strength", "15",         # stronger than default (8) — great for flat anime
+        "-temporal-aq", "1",          
+        "-aq-strength", "15",         
 
-        # B-frames & reference management
-        "-rc-lookahead", "50",        # 50-frame lookahead for better VBR decisions
+        "-rc-lookahead", "50",        
         "-bf",           "4",
         "-b_ref_mode",   "middle",
         "-refs",         "4",
-        "-weighted_pred","1",         # better handling of fades/transitions
+        "-weighted_pred","1",         
 
-        # Audio / subtitles passthrough
         "-c:a", "copy",
         *([ "-c:s", "copy"] if has_subs else []),
 
@@ -1448,7 +1343,7 @@ async def run_encode(task: Task, spec: QualitySpec,
                      out_path: Path, prog_msg: Message):
     cancel = task.quality_cancel_flags[spec.label]
 
-    async with _encode_sem:   # RTX 6000 dual NVENC — max 2 simultaneous
+    async with _encode_sem:   
         if cancel.is_set() or task.cancel_flag.is_set(): return
 
         audio_idx = await _find_main_audio(task.input_path)
@@ -1507,7 +1402,7 @@ async def run_encode(task: Task, spec: QualitySpec,
             raise RuntimeError(f"FFmpeg error:\n{''.join(stderr_lines[-20:])}")
 
 # ── Upload ────────────────────────────────────────────────────────────────────
-TG_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
+TG_LIMIT = 2 * 1024 * 1024 * 1024   
 
 def build_caption(task: Task, quality: str) -> str:
     title = task.output_name or task.series_name or task.raw_name
@@ -1579,12 +1474,15 @@ async def quality_worker(task: Task, spec: QualitySpec,
         task.encode_done_flags[label].set(); return
 
     if err_str:
-        log.error(f"[{label}] encode error: {err_str[:200]}")
-        try: await prog_msg.edit(
-                f"❌ **[{label}]** Failed:\n```\n{err_str[:1800]}\n```",
-                reply_markup=None)
-        except: pass
-        task.encode_done_flags[label].set(); return
+    log.error(f"[{label}] encode error: {err_str[:200]}")
+    try: 
+        # Removed the triple backticks from the string to prevent UI parsing bugs
+        await prog_msg.edit(
+            f"❌ **[{label}]** Failed:\n{err_str[:1800]}",
+            reply_markup=None
+        )
+    except: pass
+    task.encode_done_flags[label].set(); return
 
     task.encode_done_flags[label].set()
     try: await prog_msg.edit(f"✅ **[{label}]** Encoded! Uploading…", reply_markup=None)
@@ -1717,13 +1615,10 @@ async def cmd_shutdown(c, m: Message):
     deactivate_machine()
 
 # ── Universal message router ──────────────────────────────────────────────────
-# Bot-message guard is handled inside the function (filters.user is a factory
-# in Pyrogram, not a standalone boolean filter — using it bare with & crashes).
 @app.on_message(
     ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
 )
 async def msg_router(c, m: Message):
-    # Ignore messages sent by any bot (including ourselves in group chats)
     if not m.from_user or m.from_user.is_bot:
         return
 
@@ -1823,8 +1718,6 @@ async def on_callback(c, q: CallbackQuery):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OCR pipeline  (/ocr)
-#  Download → Full-frame OCR → ChatGPT translate → Smart ASS →
-#  Mux → Upload mux + Encode all qualities simultaneously
 # ══════════════════════════════════════════════════════════════════════════════
 async def _run_ocr(c, m: Message, task: Task):
     chat_id = task.chat_id
@@ -2016,7 +1909,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
     status  = await m.reply("⏳ Initializing encoder…", reply_markup=CANCEL_BTN)
     task.status_msg = status
     try:
-        # 1. Download (optional)
         if not skip_dl:
             task.stage = Stage.DOWNLOADING
             video_path = await _download_video(c, m, task, status)
@@ -2024,7 +1916,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
                 return await safe_edit(status, "❌ No video received.")
             if task.cancel_flag.is_set(): raise InterruptedError()
             task.input_path = video_path
-            # Cache for /log re-use
             vid_id  = uuid.uuid4().hex[:8]
             cache_p = DL / f"{vid_id}.mkv"
             try:
@@ -2038,7 +1929,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
 
         await extract_meta(task)
 
-        # 2. Name
         task.stage = Stage.AWAIT_NAME
         await m.reply(
             f"✅ Ready: `{task.input_path.name}`\n"
@@ -2051,7 +1941,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
         if task.cancel_flag.is_set(): raise InterruptedError()
         parse_name(name_raw, task)
 
-        # 3. Thumbnail
         task.stage = Stage.AWAIT_THUMB
         await m.reply("🖼 **Send thumbnail** (or type `skip`):")
         try:
@@ -2067,7 +1956,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
             tp = await thumb_res.download(file_name=str(task.work_dir / "thumb.jpg"))
             task.thumb_path = Path(tp)
 
-        # 4. Confirm
         task.stage = Stage.CONFIRMING
         ch_id  = resolve_channel(task.series_name)
         lines  = ["📋 **Confirm encode job (hevc_nvenc p7 + multipass):**\n"]
@@ -2088,7 +1976,6 @@ async def _run_enc(c, m: Message, task: Task, skip_dl: bool = False):
         try: await confirm_msg.edit_reply_markup(None)
         except: pass
 
-        # 5. Encode
         task.stage  = Stage.ENCODING
         target_chat = ch_id or task.chat_id
         await m.reply(
