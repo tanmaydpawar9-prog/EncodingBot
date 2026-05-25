@@ -431,6 +431,11 @@ def stitch_continuous_lines(subs: list, max_gap: float = 0.15) -> list:
     if not subs: return []
     out = [subs[0].copy()]
     for cur in subs[1:]:
+        # Fix: Prevent IndexError if the previous glitch subtitle was popped out
+        if not out:
+            out.append(cur.copy())
+            continue
+            
         prev = out[-1]
         gap  = cur["start"] - prev["end"]
         if gap <= max_gap and _same_sub(prev, cur):
@@ -1755,19 +1760,27 @@ async def _run_ocr(c, m: Message, task: Task):
         else:
             en_texts = [""] * len(final_subs)
 
-        # 6. Write Smart ASS
-        ass_path = base + "_smart.ass"
-        write_smart_ass(final_subs, en_texts, ass_path, ocr_w, ocr_h)
-        await m.reply_document(ass_path,
-            caption=(f"🎨 **Smart ASS** — {len(final_subs)} cues\n"
-                     f"PlayResX: {ocr_w} · PlayResY: {ocr_h}\n"
-                     f"Styles: Default / MoveName / Overlay / TopTitle / Translation"))
+        # 6. Write Standard SRT (Replaces Smart ASS)
+        final_srt_path = base + "_translated.srt"
+        combined_texts = []
+        for zh, en in zip(zh_texts, en_texts):
+            en_clean = en.strip()
+            if en_clean:
+                # Stack Chinese on top, English on bottom for normal SRT
+                combined_texts.append(f"{zh}\n{en_clean}")
+            else:
+                combined_texts.append(zh)
+                
+        write_srt(final_subs, combined_texts, final_srt_path)
+        await m.reply_document(final_srt_path,
+            caption=(f"📄 **Final Subtitles (.srt)** — {len(final_subs)} cues\n"
+                     f"Standard Chinese + English format."))
 
         # 7. Wait for mux subtitle
         task.stage = Stage.AWAIT_SUB
         await safe_edit(status,
             "✅ **OCR + Translation complete!**\n\n"
-            "📎 Send the subtitle to mux (`.ass` recommended — use the Smart ASS above).\n"
+            "📎 Send the subtitle to mux (Use the `.srt` generated above).\n"
             "_Or send a custom `.srt` / `.ass` file._",
             CANCEL_BTN)
         try:
