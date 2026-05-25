@@ -1551,7 +1551,7 @@ async def cmd_shutdown(c, m: Message):
 # filters.user = only messages from real users (excludes bots, channels, etc.)
 # This prevents the bot from reacting to its own messages or other bots' replies.
 @app.on_message(
-    filters.user
+    filters.all
     & ~filters.command(["ocr","enc","log","cancel","start","status","shutdown"])
 )
 async def msg_router(c, m: Message):
