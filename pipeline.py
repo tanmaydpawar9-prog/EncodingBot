@@ -395,6 +395,12 @@ def _load_ocr(gpu_id: int = 0):
         import easyocr
         import torch
         
+        if torch.cuda.is_available():
+            # Apply GPU Speed Hacks for RTX Ada Generation
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
         device_str = f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
         try:
             log.info(f"EasyOCR init — GPU:{gpu_id} ({device_str})")
