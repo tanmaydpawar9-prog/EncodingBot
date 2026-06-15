@@ -542,13 +542,12 @@ def suppress_static_overlay_cues(subs: list, fw: int, fh: int, dur: float) -> li
 #  Frame pre-processing and OCR  (Optimized + Cropped for EasyOCR)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_text_easyocr(engine, frame_crop: np.ndarray, y_offset: int) -> list:
+def _extract_text_easyocr(engine, frame: np.ndarray) -> list:
     """
-    OPTIMIZED FOR EASYOCR (BOTTOM CROP):
-    Receives only the bottom 22% of the frame. Runs single-pass. 
-    Adds y_offset back to the points so subtitles stay at the absolute bottom.
+    FULL FRAME EASYOCR:
+    Scans the entire 100% of the frame for detailed subtitles and on-screen info.
     """
-    img_rgb = cv2.cvtColor(frame_crop, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     unique_lines = []
     
     try:
@@ -569,9 +568,8 @@ def _extract_text_easyocr(engine, frame_crop: np.ndarray, y_offset: int) -> list
         if conf < 0.15: 
             continue
         
-        # pts is a list of 4 [x, y] coordinates. 
-        # We add y_offset to bring them back to full-frame resolution.
-        full_frame_pts = [[float(p[0]), float(p[1] + y_offset)] for p in pts]
+        # pts is a list of 4 [x, y] coordinates natively matching the full frame.
+        full_frame_pts = [[float(p[0]), float(p[1])] for p in pts]
         
         unique_lines.append((full_frame_pts, (text, conf)))
 
