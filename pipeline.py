@@ -890,17 +890,23 @@ _REGION_BOTTOM = 2.0
 _REGION_TOP    = -1.0   
 
 def _pick_style(sub: dict, frame_w: int, frame_h: int) -> str:
-    y_r  = sub.get("y", frame_h * 0.9) / max(frame_h, 1)
-    bh_r = sub.get("bh", 0)            / max(frame_h, 1)
-    if   y_r  > _REGION_BOTTOM: return "Default"
-    elif y_r  < _REGION_TOP:    return "TopTitle"
-    elif bh_r > 0.055:          return "MoveName"   
-    else:                       return "Overlay"     
+    y_r = sub.get("y", frame_h * 0.9) / max(frame_h, 1)
+    bh_r = sub.get("bh", 0) / max(frame_h, 1)
+    if y_r > _REGION_BOTTOM:
+        return "Default"
+    elif y_r < _REGION_TOP:
+        return "TopTitle"
+    elif bh_r > 0.055:
+        return "MoveName"
+    else:
+        return "Overlay"
 
-def write_smart_ass(subs: list, en_texts: list, path: str,
-                    frame_w: int, frame_h: int) -> None:
-    play_x = frame_w
-    play_y = frame_h
+def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int,
+                    frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
+    play_x = orig_w if orig_w else frame_w
+    play_y = orig_h if orig_h else frame_h
+    scale_x = play_x / max(frame_w, 1)
+    scale_y = play_y / max(frame_h, 1)
 
     fs_default   = int(play_y * 0.055)   
     fs_movename  = int(play_y * 0.058)   
@@ -939,8 +945,14 @@ Style: Translation,Arial,{fs_trans},{LTGREY},&H000000FF,{OUTLINE},{SHADOW},0,0,0
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
     events: list[str] = []
+
+    trans_overrides = (
+        f"\\fs{fs_trans}"
+        f"\\c{LTGREY}"
+        f"\\bord2.0"
+        f"\\shad1.0"
+    )
 
     for sub, en in zip(subs, en_texts):
         style    = _pick_style(sub, frame_w, frame_h)
@@ -948,25 +960,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         en_clean = _ass_escape(en.strip()) if en and en.strip() else ""
         ts_s     = ass_ts(sub["start"])
         ts_e     = ass_ts(sub["end"])
-        x        = float(sub.get("x", frame_w / 2))
-        y        = float(sub.get("y", frame_h * 0.88))
-        bh       = float(sub.get("bh", frame_h * 0.05))
 
         has_en = bool(en_clean)
 
+        # Apply scaling to OCR coordinates to match original video resolution
+        x  = float(sub.get("x", frame_w / 2)) * scale_x
+        y  = float(sub.get("y", frame_h * 0.88)) * scale_y
+        bh = float(sub.get("bh", frame_h * 0.05)) * scale_y
+
         if style in ("Default", "TopTitle"):
             if has_en:
-                text = f"{zh}\\N{{\\rTranslation}}{en_clean}"
+                # For bottom-aligned text (Default, align 2), \N stacks upwards.
+                # "zh\Nen" renders "en" above "zh".
+                # For top-aligned text (TopTitle, align 8), \N stacks downwards.
+                # "zh\Nen" renders "en" below "zh". We must reverse it.
+                if style == "Default":
+                    text = f"{zh}\\N{{{trans_overrides}}}{en_clean}"
+                else: # TopTitle
+                    text = f"{{{trans_overrides}}}{en_clean}\\N{zh}"
             else:
                 text = zh
             events.append(
                 f"Dialogue: 0,{ts_s},{ts_e},{style},,0,0,0,,{text}")
 
-        else:
-            en_y = y + (bh * 0.55) + int(play_y * 0.036)  
+        else: # For MoveName and Overlay
+            margin = fs_trans * 0.2
+            # Heuristic: if original text is in top half of screen, place translation below.
+            if y < (play_y / 2):
+                # Top half: place translation BELOW
+                en_y = y + (bh * 0.5) + margin
+                en_align_tag = r"\an8" # Align: bottom-center
+            else:
+                # Bottom half: place translation ABOVE
+                en_y = y - (bh * 0.5) - margin
+                en_align_tag = r"\an2" # Align: top-center
 
             zh_tag = f"{{\\an5\\pos({x:.0f},{y:.0f})}}"
-            en_tag = f"{{\\an8\\pos({x:.0f},{en_y:.0f})}}"   
+            en_tag = f"{{{en_align_tag}\\pos({x:.0f},{en_y:.0f})}}"
 
             events.append(
                 f"Dialogue: 0,{ts_s},{ts_e},{style},,0,0,0,,{zh_tag}{zh}")
