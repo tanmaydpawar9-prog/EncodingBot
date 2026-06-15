@@ -614,9 +614,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
     threading.Thread(target=_reader, daemon=True).start()
     frame_dur = 1.0 / extract_fps
     
-    # Calculate the crop for the bottom 22% of the frame
-    y_offset = int(frame_h * 0.78)
-
     while True:
         item = fq.get()
         if item is None: break
@@ -637,23 +634,19 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
             except Exception as _se:
                 log.debug(f"Frame save failed: {_se}")
 
-        # Slicing a numpy array takes 0.00001 seconds. 
-        # This reduces the frame area EasyOCR has to scan by 78%!
-        frame_crop = frame[y_offset:, :, :]
-
-        gray = cv2.cvtColor(frame_crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mn, mx = cv2.minMaxLoc(gray)[:2]
         if mx < 50:
             continue
 
-        lines = _extract_text_easyocr(engine, frame_crop, y_offset)
+        lines = _extract_text_easyocr(engine, frame)
 
         if lines and _first_cue[0]:
             _first_cue[0] = False
             log.info(f"🎯 First OCR hit at frame {idx} (t={cur_t:.2f}s) "
                      f"— {len(lines)} line(s)")
             try:
-                # We draw on the FULL frame so you can verify the y_offset math worked
+                # We draw on the FULL frame to verify exact OCR hits
                 ann = frame.copy()
                 for _pts, _rec in lines:
                     _pa = np.array(_pts, dtype=np.int32)
@@ -909,12 +902,12 @@ def write_smart_ass(subs: list, en_texts: list, path: str,
     play_x = frame_w
     play_y = frame_h
 
-    fs_default   = int(play_y * 0.048)   
+    fs_default   = int(play_y * 0.055)   
     fs_movename  = int(play_y * 0.058)   
     fs_overlay   = int(play_y * 0.040)   
     fs_toptitle  = int(play_y * 0.044)   
     fs_trans     = int(play_y * 0.034)   
-    margin_bot   = int(play_y * 0.055)   
+    margin_bot   = int(play_y * 0.111)   
     margin_top   = int(play_y * 0.038)   
 
     WHITE    = "&H00FFFFFF"
@@ -937,11 +930,11 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Trebuchet MS,{fs_default},{WHITE},&H000000FF,{BLACK},{SHADOW},-1,0,0,0,100,100,0,0,1,2.5,1.0,2,80,80,{margin_bot},1
-Style: MoveName,Trebuchet MS,{fs_movename},{CYAN},&H000000FF,{OUTLINE},{SHADOW},-1,0,0,0,100,100,1.5,0,1,3.0,2.0,5,0,0,0,1
-Style: Overlay,Trebuchet MS,{fs_overlay},{YELLOW},&H000000FF,{BLACK},{SHADOW},0,0,0,0,100,100,0,0,1,2.5,1.5,5,0,0,0,1
-Style: TopTitle,Trebuchet MS,{fs_toptitle},{WHITE},&H000000FF,{BLACK},{SHADOW},-1,0,0,0,100,100,0,0,1,2.5,1.0,8,80,80,{margin_top},1
-Style: Translation,Trebuchet MS,{fs_trans},{LTGREY},&H000000FF,{OUTLINE},{SHADOW},0,0,0,0,100,100,0,0,1,2.0,1.0,5,0,0,0,1
+Style: Default,Arial,{fs_default},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,70,90,1,0,1,2,2,2,400,400,{margin_bot},1
+Style: MoveName,Arial,{fs_movename},{CYAN},&H000000FF,{OUTLINE},{SHADOW},-1,0,0,0,70,90,1.5,0,1,3.0,2.0,5,0,0,0,1
+Style: Overlay,Arial,{fs_overlay},{YELLOW},&H000000FF,{BLACK},{SHADOW},0,0,0,0,70,90,1,0,1,2.5,1.5,5,0,0,0,1
+Style: TopTitle,Arial,{fs_toptitle},{WHITE},&H000000FF,{BLACK},{SHADOW},-1,0,0,0,70,90,1,0,1,2.5,1.0,8,400,400,{margin_top},1
+Style: Translation,Arial,{fs_trans},{LTGREY},&H000000FF,{OUTLINE},{SHADOW},0,0,0,0,70,90,1,0,1,2.0,1.0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -966,9 +959,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 text = f"{zh}\\N{{\\rTranslation}}{en_clean}"
             else:
                 text = zh
-            mrg  = margin_bot if style == "Default" else margin_top
             events.append(
-                f"Dialogue: 0,{ts_s},{ts_e},{style},,80,80,{mrg},,{text}")
+                f"Dialogue: 0,{ts_s},{ts_e},{style},,0,0,0,,{text}")
 
         else:
             en_y = y + (bh * 0.55) + int(play_y * 0.036)  
@@ -1760,28 +1752,19 @@ async def _run_ocr(c, m: Message, task: Task):
         else:
             en_texts = [""] * len(final_subs)
 
-        # 6. Write Standard SRT (Replaces Smart ASS)
-        final_srt_path = base + "_translated.srt"
-        combined_texts = []
-        for zh, en in zip(zh_texts, en_texts):
-            en_clean = en.strip()
-            if en_clean:
-                # Stack Chinese on top, English on bottom for normal SRT
-                combined_texts.append(f"{zh}\n{en_clean}")
-            else:
-                combined_texts.append(zh)
-                
-        write_srt(final_subs, combined_texts, final_srt_path)
-        await m.reply_document(final_srt_path,
-            caption=(f"📄 **Final Subtitles (.srt)** — {len(final_subs)} cues\n"
-                     f"Standard Chinese + English format."))
+        # 6. Write Smart ASS
+        final_ass_path = base + "_translated.ass"
+        write_smart_ass(final_subs, en_texts, final_ass_path, ocr_w, ocr_h, task.src_width, task.src_height)
+        await m.reply_document(final_ass_path,
+            caption=(f"📄 **Final Subtitles (.ass)** — {len(final_subs)} cues\n"
+                     f"Smart position-aware format."))
 
         # 7. Wait for mux subtitle
         task.stage = Stage.AWAIT_SUB
         await safe_edit(status,
             "✅ **OCR + Translation complete!**\n\n"
-            "📎 Send the subtitle to mux (Use the `.srt` generated above).\n"
-            "_Or send a custom `.srt` / `.ass` file._",
+            "📎 Send the subtitle to mux (Use the `.ass` generated above).\n"
+            "_Or send a custom `.ass` / `.srt` file._",
             CANCEL_BTN)
         try:
             sub_msg = await asyncio.wait_for(task.subtitle_future, timeout=600)
