@@ -893,8 +893,8 @@ def ass_ts(sec: float) -> str:
 def _ass_escape(text: str) -> str:
     return text.replace("\\", "\u2060").replace("{", r"\{").replace("}", r"\}")
 
-_REGION_BOTTOM = 0.75   
-_REGION_TOP    = 0.22   
+_REGION_BOTTOM = 2.0   
+_REGION_TOP    = -1.0   
 
 def _pick_style(sub: dict, frame_w: int, frame_h: int) -> str:
     y_r  = sub.get("y", frame_h * 0.9) / max(frame_h, 1)
