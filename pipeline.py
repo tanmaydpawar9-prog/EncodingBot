@@ -422,58 +422,75 @@ def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.75) -> list:
     if not cues:
         return []
 
-    band_px = max(frame_h * 0.05, 1.0)
-    bands = {}
+    # 1. Sort all cues strictly by start time
+    cues.sort(key=lambda c: (c["start"], c.get("x", 0)))
+
+    active_subs = []
+    finished_subs = []
+
+    # Generous tolerance for OCR bounding box jitter (approx 8% of screen height)
+    y_tol = max(frame_h * 0.08, 40.0) 
 
     for cue in cues:
-        y = float(cue.get("y", frame_h / 2))
-        key = int(y / band_px)
-        bands.setdefault(key, []).append(cue)
+        # Clean up active subs that have timed out (gap > max_gap)
+        still_active = []
+        for active in active_subs:
+            if cue["start"] - active["end"] > max_gap:
+                finished_subs.append(active)
+            else:
+                still_active.append(active)
+        active_subs = still_active
 
-    result = []
-
-    for key in sorted(bands.keys()):
-        band_cues = sorted(bands[key], key=lambda c: (c["start"], c.get("x", 0)))
-        if not band_cues:
+        matched = False
+        cur_txt = _norm(cue.get("cmp") or cue.get("text", ""))
+        if not cur_txt:
             continue
 
-        cur = band_cues[0].copy()
-
-        for nxt in band_cues[1:]:
-            gap = float(nxt["start"]) - float(cur["end"])
-
-            cur_txt = _norm(cur.get("cmp") or cur.get("text", ""))
-            nxt_txt = _norm(nxt.get("cmp") or nxt.get("text", ""))
-
-            same_text = (
-                bool(cur_txt)
-                and bool(nxt_txt)
-                and (
-                    cur_txt == nxt_txt
-                    or difflib.SequenceMatcher(None, cur_txt, nxt_txt).ratio() >= 0.90
-                )
-            )
-
-            same_pos = abs(float(nxt.get("y", 0)) - float(cur.get("y", 0))) <= max(80.0, frame_h * 0.04)
-
-            if same_text and same_pos and gap <= max_gap:
-                cur["end"] = max(float(cur["end"]), float(nxt["end"]))
-
-                if len(nxt_txt) > len(cur_txt):
-                    cur["text"] = nxt.get("text", cur.get("text", ""))
-                    cur["cmp"] = nxt.get("cmp", cur.get("cmp", ""))
-
-                cur["x"] = (float(cur.get("x", 0)) + float(nxt.get("x", 0))) / 2.0
-                cur["y"] = (float(cur.get("y", 0)) + float(nxt.get("y", 0))) / 2.0
-                cur["bh"] = max(float(cur.get("bh", 0)), float(nxt.get("bh", 0)))
+        # 2. Try to match the current cue with an active subtitle track
+        for active in active_subs:
+            # Spatial check
+            same_pos = abs(float(cue.get("y", 0)) - float(active.get("y", 0))) <= y_tol
+            if not same_pos:
+                continue
+            
+            act_txt = _norm(active.get("cmp") or active.get("text", ""))
+            
+            # Text similarity check (Fuzzy + Substring)
+            is_sim = False
+            if cur_txt == act_txt or cur_txt in act_txt or act_txt in cur_txt:
+                is_sim = True
             else:
-                result.append(cur)
-                cur = nxt.copy()
+                # Lowered ratio to 0.65 to account for OCR recognition noise/flicker
+                if difflib.SequenceMatcher(None, cur_txt, act_txt).ratio() >= 0.65:
+                    is_sim = True
+            
+            if is_sim:
+                # Extend the duration
+                active["end"] = max(float(active["end"]), float(cue["end"]))
+                
+                # Keep the longest (usually most complete) text read
+                if len(cur_txt) > len(act_txt):
+                    active["text"] = cue.get("text", active.get("text", ""))
+                    active["cmp"] = cur_txt
+                
+                # Gently average coordinates to stabilize the position
+                active["x"] = (float(active.get("x", 0)) + float(cue.get("x", 0))) / 2.0
+                active["y"] = (float(active.get("y", 0)) + float(cue.get("y", 0))) / 2.0
+                active["bh"] = max(float(active.get("bh", 0)), float(cue.get("bh", 0)))
+                
+                matched = True
+                break # Found its matching chain, stop looking
 
-        result.append(cur)
+        # If it didn't match any active track, it's a new subtitle event
+        if not matched:
+            active_subs.append(cue.copy())
 
-    result.sort(key=lambda c: c["start"])
-    return result
+    # Flush remaining active tracks
+    finished_subs.extend(active_subs)
+    
+    # Final sort for subtitle output format
+    finished_subs.sort(key=lambda c: c["start"])
+    return finished_subs
        
 def _flatten_paddle_result(result) -> list:
     if not result:
