@@ -626,7 +626,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     bpf   = s_w * s_h * 3
     t0 = time.time()
 
-    NUM_WORKERS = 4
+    NUM_WORKERS = 8
 
     push(status_msg,
          f"⚡ **Multi-Process Full Frame OCR** — {s_w}×{s_h} @ {extract_fps:.2f} fps\n"
