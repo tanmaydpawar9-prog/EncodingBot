@@ -812,6 +812,11 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
     lines = ass_text.splitlines()
     out = []
 
+    def clean_text(s: str) -> str:
+        s = re.sub(r"\{.*?\}", "", s)
+        s = s.replace("\\N", " ")
+        return _norm(s)
+
     def parse_dialogue(line: str):
         if not line.startswith("Dialogue:"):
             return None
@@ -824,14 +829,12 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
         except:
             return None
         text = parts[9]
-        clean = _norm(re.sub(r"\{.*?\}", "", text).replace("\\N", ""))
         return {
             "parts": parts,
             "start": start,
             "end": end,
             "text": text,
-            "clean": clean,
-            "raw_line": line,
+            "clean": clean_text(text),
         }
 
     cur = None
@@ -840,7 +843,7 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
         item = parse_dialogue(line)
         if item is None:
             if cur is not None:
-                out.append(cur["raw_line"])
+                out.append(",".join(cur["parts"]))
                 cur = None
             out.append(line)
             continue
@@ -849,26 +852,28 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
             cur = item
             continue
 
-        same_text = (
-            cur["clean"] == item["clean"]
-            or (
-                cur["clean"] and item["clean"]
-                and difflib.SequenceMatcher(None, cur["clean"], item["clean"]).ratio() >= 0.90
-            )
-        )
         same_style = cur["parts"][3:9] == item["parts"][3:9]
         gap = item["start"] - cur["end"]
 
-        if same_text and same_style and gap <= max_gap:
+        sim = 0.0
+        if cur["clean"] and item["clean"]:
+            if cur["clean"] == item["clean"]:
+                sim = 1.0
+            else:
+                sim = difflib.SequenceMatcher(None, cur["clean"], item["clean"]).ratio()
+
+        if same_style and gap <= max_gap and sim >= 0.70:
             cur["end"] = max(cur["end"], item["end"])
-            cur["parts"][2] = ass_ts(cur["end"])
-            cur["raw_line"] = ",".join(cur["parts"])
+            cur["parts"][2] = item["parts"][2]
+            if len(item["clean"]) > len(cur["clean"]):
+                cur["parts"][9] = item["parts"][9]
+                cur["clean"] = item["clean"]
         else:
-            out.append(cur["raw_line"])
+            out.append(",".join(cur["parts"]))
             cur = item
 
     if cur is not None:
-        out.append(cur["raw_line"])
+        out.append(",".join(cur["parts"]))
 
     return "\n".join(out)
        
@@ -1774,15 +1779,15 @@ async def _run_ocr(c, m: Message, task: Task):
         # 6. Write Requested ASS format
         final_ass_path = base + "_translated.ass"
         write_smart_ass(final_subs, en_texts, final_ass_path, ocr_w, ocr_h, task.src_width, task.src_height)
-
+       
         with open(final_ass_path, "r", encoding="utf-8-sig", errors="replace") as f:
             ass_raw = f.read()
-
+       
         ass_merged = merge_ass_dialogues(ass_raw, max_gap=0.90)
-
+       
         with open(final_ass_path, "w", encoding="utf-8-sig") as f:
             f.write(ass_merged)
-
+       
         await m.reply_document(final_ass_path, caption=f"📄 Final Subtitles (.ass) — {len(final_subs)} cues\nCustom Fixed Layout.")
         # 7. Wait for mux subtitle
         task.stage = Stage.AWAIT_SUB
