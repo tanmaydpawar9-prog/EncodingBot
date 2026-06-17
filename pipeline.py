@@ -418,44 +418,63 @@ def _same_sub(a: dict, b: dict, thr: float = 0.80) -> bool:
     if ak == bk: return True
     return difflib.SequenceMatcher(None, ak, bk).ratio() >= thr
 
-def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.35) -> list:
+def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.75) -> list:
     if not cues:
         return []
 
-    # Sort once, then merge in a single pass
-    cues = sorted(cues, key=lambda c: (c["start"], c.get("y", 0), c.get("x", 0)))
-    merged = []
-    cur = cues[0].copy()
+    band_px = max(frame_h * 0.05, 1.0)
+    bands = {}
 
-    def norm_text(c):
-        return _norm(c.get("cmp") or c.get("text", ""))
+    for cue in cues:
+        y = float(cue.get("y", frame_h / 2))
+        key = int(y / band_px)
+        bands.setdefault(key, []).append(cue)
 
-    for nxt in cues[1:]:
-        cur_txt = norm_text(cur)
-        nxt_txt = norm_text(nxt)
+    result = []
 
-        same_text = bool(cur_txt) and bool(nxt_txt) and (
-            cur_txt == nxt_txt or difflib.SequenceMatcher(None, cur_txt, nxt_txt).ratio() >= 0.88
-        )
+    for key in sorted(bands.keys()):
+        band_cues = sorted(bands[key], key=lambda c: (c["start"], c.get("x", 0)))
+        if not band_cues:
+            continue
 
-        same_band = abs(float(nxt.get("y", 0)) - float(cur.get("y", 0))) <= max(frame_h * 0.08, 80)
-        touching  = float(nxt["start"]) <= float(cur["end"]) + max_gap
+        cur = band_cues[0].copy()
 
-        if same_text and same_band and touching:
-            cur["end"] = max(float(cur["end"]), float(nxt["end"]))
-            cur["x"] = (float(cur.get("x", 0)) + float(nxt.get("x", 0))) / 2
-            cur["y"] = (float(cur.get("y", 0)) + float(nxt.get("y", 0))) / 2
-            cur["bh"] = max(float(cur.get("bh", 0)), float(nxt.get("bh", 0)))
-            if len(nxt_txt) > len(cur_txt):
-                cur["text"] = nxt.get("text", cur.get("text", ""))
-                cur["cmp"] = nxt.get("cmp", cur.get("cmp", ""))
-        else:
-            merged.append(cur)
-            cur = nxt.copy()
+        for nxt in band_cues[1:]:
+            gap = float(nxt["start"]) - float(cur["end"])
 
-    merged.append(cur)
-    return merged
+            cur_txt = _norm(cur.get("cmp") or cur.get("text", ""))
+            nxt_txt = _norm(nxt.get("cmp") or nxt.get("text", ""))
 
+            same_text = (
+                bool(cur_txt)
+                and bool(nxt_txt)
+                and (
+                    cur_txt == nxt_txt
+                    or difflib.SequenceMatcher(None, cur_txt, nxt_txt).ratio() >= 0.90
+                )
+            )
+
+            same_pos = abs(float(nxt.get("y", 0)) - float(cur.get("y", 0))) <= max(80.0, frame_h * 0.04)
+
+            if same_text and same_pos and gap <= max_gap:
+                cur["end"] = max(float(cur["end"]), float(nxt["end"]))
+
+                if len(nxt_txt) > len(cur_txt):
+                    cur["text"] = nxt.get("text", cur.get("text", ""))
+                    cur["cmp"] = nxt.get("cmp", cur.get("cmp", ""))
+
+                cur["x"] = (float(cur.get("x", 0)) + float(nxt.get("x", 0))) / 2.0
+                cur["y"] = (float(cur.get("y", 0)) + float(nxt.get("y", 0))) / 2.0
+                cur["bh"] = max(float(cur.get("bh", 0)), float(nxt.get("bh", 0)))
+            else:
+                result.append(cur)
+                cur = nxt.copy()
+
+        result.append(cur)
+
+    result.sort(key=lambda c: c["start"])
+    return result
+       
 def _flatten_paddle_result(result) -> list:
     if not result:
         return []
@@ -722,9 +741,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     raw.sort(key=lambda x: x["start"])
 
     before_merge = len(raw)
-
-    raw = group_and_merge(raw, s_h, max_gap=0.5)
-
+    raw = group_and_merge(raw, s_h, max_gap=0.75)
     after_merge = len(raw)
 
     log.info(
