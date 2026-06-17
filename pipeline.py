@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-TheFrictionRealm — Lightning AI Unified Bot v4.3 (RTX PRO 6000 Blackwell Max Juice)
+TheFrictionRealm — Lightning AI Unified Bot v4.4 (RTX PRO 6000 Blackwell Max Juice)
 GPU  : RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7 ECC, 4x NVENC, 4x NVDEC)
        — 4 independent OCR PROCESSES, real parallel GPU usage
 OCR  : PaddleOCR Full Frame 100% Scan @ NATIVE FPS (Every single frame)
-Subs : Clean .ASS with requested custom style + Spatial Band Merging
+Subs : PlayRes source/2 | Exact Style match | Anti-overlap positioning
 Enc  : hevc_nvenc p7 + multipass fullres + cq19 + maxed AQ
 """
 
@@ -28,11 +28,6 @@ import difflib, threading, queue, traceback, io, uuid
 import http.server, socketserver, concurrent.futures
 import multiprocessing as mp
 
-# CUDA + multiprocessing requires 'spawn' (fork would inherit a half-initialised
-# CUDA context from the parent process and hang/crash). Each spawned child gets
-# its own clean interpreter, its own CUDA context, its own OCR engine instance —
-# this is what actually gives you parallel GPU throughput instead of N threads
-# fighting the GIL over one shared model object.
 _MP_CTX = mp.get_context("spawn")
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -167,7 +162,7 @@ QUALITY_SPECS = [
     QualitySpec("720p",  1280,  720),
 ]
 
-_encode_sem = asyncio.Semaphore(3)  # 4x NVENC engines on this card — all 3 quality profiles can run truly in parallel
+_encode_sem = asyncio.Semaphore(3)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  State machine
@@ -385,19 +380,18 @@ app = Client(
 def _load_ocr(gpu_id: int = 0):
     if gpu_id not in _OCR_ENGINES:
         from paddleocr import PaddleOCR
-
         last_err = None
         for attempt in range(1, 4):
             try:
                 log.info(f"PaddleOCR init — GPU:{gpu_id} (pid={os.getpid()}, attempt {attempt}/3)")
                 _OCR_ENGINES[gpu_id] = PaddleOCR(
-                    use_angle_cls=False,   # subtitles are upright, skip the rotation classifier
-                    lang="ch",             # ch model covers ch_sim + latin/digits, same coverage as easyocr ['ch_sim','en']
+                    use_angle_cls=False,   
+                    lang="ch",             
                     use_gpu=True,
                     gpu_id=gpu_id,
                     show_log=False,
                     det_db_box_thresh=0.5,
-                    rec_batch_num=32,      # batch the recognition crops within one frame
+                    rec_batch_num=32,      
                     cpu_threads=4,
                 )
                 log.info(f"PaddleOCR ready GPU:{gpu_id} (pid={os.getpid()})")
@@ -425,42 +419,41 @@ def _same_sub(a: dict, b: dict, thr: float = 0.80) -> bool:
     return difflib.SequenceMatcher(None, ak, bk).ratio() >= thr
 
 def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.5) -> list:
-    """
-    Groups OCR lines into horizontal spatial bands (Y-axis) BEFORE stitching.
-    This entirely prevents bottom subtitles from interfering with top-corner text,
-    allowing overlapping timecodes to be merged perfectly into the ASS file.
-    """
-    if not cues: 
-        return []
+    if not cues: return []
     
-    # 5% of height logic bounds the regions 
-    band_px = max(frame_h * 0.05, 1.0)
+    # 1. Separate cues by location (Y-axis bands) so top text doesn't interrupt bottom text
+    band_px = max(frame_h * 0.05, 1.0) 
     bands = {}
     for cue in cues:
         key = int(cue.get("y", frame_h / 2) / band_px)
         bands.setdefault(key, []).append(cue)
     
     result = []
+    # 2. Apply the match-match-not match logic to EACH location independently
     for band_cues in bands.values():
-        band_cues.sort(key=lambda c: c["start"])
+        band_cues.sort(key=lambda c: c["start"]) 
         
         merged_band = []
-        cur = band_cues[0].copy()
+        cur = band_cues[0].copy() # Set -> current
+        
         for nxt in band_cues[1:]:
             gap = nxt["start"] - cur["end"]
-            # Fuzzy match prevents flickering OCR from breaking the merge chain
+            
+            # Check next if it is same as current text AND timestamp is within gap
             if gap <= max_gap and _same_sub(cur, nxt):
-                cur["end"] = max(cur["end"], nxt["end"])
-                # Adopt the longest clean text as canon
+                # match -> Merge the matching!
+                cur["end"] = max(cur["end"], nxt["end"]) 
                 if len(_norm(nxt.get("text", ""))) > len(_norm(cur.get("text", ""))):
                     cur["text"] = nxt["text"]
-                    cur["cmp"] = nxt.get("cmp", "")
             else:
+                # not match -> Save current, set unmatched as current and continue
                 merged_band.append(cur)
                 cur = nxt.copy()
+                
         merged_band.append(cur)
         result.extend(merged_band)
         
+    # Re-sort everything by time for the ASS writer
     result.sort(key=lambda c: c["start"])
     return result
 
@@ -535,7 +528,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
         if progress_cb: progress_cb(idx, cues)
 
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3))
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mn, mx = cv2.minMaxLoc(gray)[:2]
         if mx < 50:
@@ -565,9 +557,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
     proc.stdout.close(); proc.wait()
     return cues
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Picklable helpers for spawned OCR worker processes
-# ══════════════════════════════════════════════════════════════════════════════
 def _make_extract_cmd(video_path: str, ss: float, dur: float,
                        s_w: int, s_h: int, extract_fps: float, thr: str = "2") -> list:
     return [
@@ -732,8 +721,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
             raw.append(s)
             
     raw.sort(key=lambda x: x["start"])
-
-    # Spatial grouped merging logic preventing ASS dumps
     raw = group_and_merge(raw, s_h, max_gap=0.5)
     return raw, s_w, s_h
 
@@ -782,7 +769,7 @@ async def batch_translate(zh_texts: list, status_msg=None, chat_id: int = None) 
     return res
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ASS Subtitle Writer (Requested Specific Style & Vertical Handling)
+#  ASS Subtitle Writer (Strict Rule Styling + Horizonatal positioning)
 # ══════════════════════════════════════════════════════════════════════════════
 def ass_ts(sec: float) -> str:
     cc = int(round(sec * 100))
@@ -795,12 +782,14 @@ def _ass_escape(text: str) -> str:
     return text.replace("\\", "\u2060").replace("{", r"\{").replace("}", r"\}")
 
 def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
-    play_x = orig_w if orig_w else 1920
-    play_y = orig_h if orig_h else 1080
+    # Exact PlayRes source/2 rule
+    play_x = (orig_w // 2) if orig_w else 960
+    play_y = (orig_h // 2) if orig_h else 540
     
     scale_x = play_x / max(frame_w, 1)
     scale_y = play_y / max(frame_h, 1)
 
+    # UPDATED: Fontsize scaled to 80, MarginV scaled to 150 for mobile readability
     header = f"""\ufeff[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_x}
@@ -808,7 +797,7 @@ PlayResY: {play_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,60,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,70,90,1,0,1,2,2,2,400,400,120,1
+Style: Default,Arial,80,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,70,90,1,0,1,2,2,2,400,400,150,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -823,31 +812,40 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         x  = float(sub.get("x", frame_w / 2)) * scale_x
         y  = float(sub.get("y", frame_h * 0.9)) * scale_y
-        bw = float(sub.get("bw", 0)) * scale_x
         bh = float(sub.get("bh", 0)) * scale_y
 
-        trans_tag = r"{\fs45\c&HD0D0D0&}"
+        # UPDATED: Scaled translation tag up to \fs60 to match the new mobile-friendly proportions
+        trans_tag = r"{\fs60\c&HD0D0D0&}"
 
+        # 1. BOTTOM DIALOGUE (Lower 20% of screen)
         if y > (play_y * 0.80):
             if en_clean:
-                text = f"{zh}\\N{trans_tag}{en_clean}"
+                # English \N Chinese -> English renders ABOVE the Chinese text.
+                # MarginV 150 pushes the whole block above the video's hardsub.
+                text = f"{en_clean}\\N{zh}"
             else:
                 text = zh
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
+            
+        # 2. UPPER 80% NON-DIALOGUE (Moves, Intros)
         else:
-            is_vertical = bh > (bw * 1.5)
-
-            if is_vertical:
-                zh_vert = "\\N".join(list(zh.replace("\\N", "")))
-                if en_clean:
-                    text = f"{{\\an5\\pos({x:.0f},{y:.0f})}}{zh_vert}\\N\\N{trans_tag}{en_clean}"
-                else:
-                    text = f"{{\\an5\\pos({x:.0f},{y:.0f})}}{zh_vert}"
+            # Forced horizontal rendering. No vertical \N injections.
+            if y < (play_y * 0.50):
+                # Top half of screen -> Push subtitle slightly BELOW the Chinese hardsub
+                y_pos = y + (bh / 2) + (play_y * 0.02)
+                align = r"\an8" 
             else:
-                if en_clean:
-                    text = f"{{\\an5\\pos({x:.0f},{y:.0f})}}{zh}\\N{trans_tag}{en_clean}"
+                # Middle of screen -> Push subtitle slightly ABOVE the Chinese hardsub
+                y_pos = y - (bh / 2) - (play_y * 0.02)
+                align = r"\an2" 
+
+            if en_clean:
+                if align == r"\an8":
+                    text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}\\N{trans_tag}{en_clean}"
                 else:
-                    text = f"{{\\an5\\pos({x:.0f},{y:.0f})}}{zh}"
+                    text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{trans_tag}{en_clean}\\N{{\\r}}{zh}"
+            else:
+                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}"
 
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
 
@@ -1329,7 +1327,7 @@ def deactivate_machine():
 @app.on_message(filters.command("start"))
 async def cmd_start(c, m: Message):
     await m.reply_text(
-        "🎬 **TheFrictionRealm — Lightning AI Bot v4.3**\n\n"
+        "🎬 **TheFrictionRealm — Lightning AI Bot v4.4**\n\n"
         "🔬 **OCR:** Max-Batch GPU Scan 100% Frame @ NATIVE FPS\n"
         "📄 **Subs:** Exact ASS Layout + Spatial Merging\n"
         "🎞 **Encode:** hevc_nvenc p7 + multipass fullres + cq19\n\n"
@@ -1890,7 +1888,7 @@ async def start_stream_server():
 async def main():
     global EVENT_LOOP
     EVENT_LOOP = asyncio.get_running_loop()
-    log.info("TheFrictionRealm Lightning AI Bot v4.3 — starting…")
+    log.info("TheFrictionRealm Lightning AI Bot v4.4 — starting…")
     log.info(f"GPUs: {NUM_GPUS} | Encode semaphore: 3 concurrent | Full-frame OCR")
     await app.start()
     await start_stream_server()
