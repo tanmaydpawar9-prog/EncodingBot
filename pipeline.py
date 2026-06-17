@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-TheFrictionRealm — Lightning AI Unified Bot v4.2 (RTX PRO 6000 Blackwell Max Juice)
+TheFrictionRealm — Lightning AI Unified Bot v4.3 (RTX PRO 6000 Blackwell Max Juice)
 GPU  : RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7 ECC, 4x NVENC, 4x NVDEC)
        — 4 independent OCR PROCESSES, real parallel GPU usage
 OCR  : PaddleOCR Full Frame 100% Scan @ NATIVE FPS (Every single frame)
-Subs : Clean .ASS with requested custom style + Vertical detection
+Subs : Clean .ASS with requested custom style + Spatial Band Merging
 Enc  : hevc_nvenc p7 + multipass fullres + cq19 + maxed AQ
 """
 
@@ -414,49 +414,64 @@ def _load_ocr(gpu_id: int = 0):
             
     return _OCR_ENGINES[gpu_id]
 
-# ── Notebook Merger Logic ─────────────────────────────────────────────────────
+# ── Spatial & Fuzzy Merger Logic ──────────────────────────────────────────────
 def _norm(txt: str) -> str:
     return re.sub(r"[\s\.,\!\?\-\—\*\(\)\[\]。！？、…]", "", txt or "")
 
-def merge_by_exact_text(cues: list, max_gap: float = 0.5) -> list:
+def _same_sub(a: dict, b: dict, thr: float = 0.80) -> bool:
+    ak, bk = _norm(a.get("text", "")), _norm(b.get("text", ""))
+    if not ak or not bk: return False
+    if ak == bk: return True
+    return difflib.SequenceMatcher(None, ak, bk).ratio() >= thr
+
+def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.5) -> list:
     """
-    Run-length merge: consecutive cues whose normalised text is identical
-    are joined into one cue by extending the end timestamp. Gap tolerant.
+    Groups OCR lines into horizontal spatial bands (Y-axis) BEFORE stitching.
+    This entirely prevents bottom subtitles from interfering with top-corner text,
+    allowing overlapping timecodes to be merged perfectly into the ASS file.
     """
-    if not cues:
+    if not cues: 
         return []
-
-    result  = []
-    cur     = cues[0].copy()
-    cur_key = _norm(cur.get("text", ""))
-
-    for nxt in cues[1:]:
-        nxt_key = _norm(nxt.get("text", ""))
-        gap     = nxt["start"] - cur["end"]
-        if nxt_key == cur_key and gap <= max_gap:
-            cur["end"] = max(cur["end"], nxt["end"])
-        else:
-            result.append(cur)
-            cur     = nxt.copy()
-            cur_key = nxt_key
-
-    result.append(cur)
+    
+    # 5% of height logic bounds the regions 
+    band_px = max(frame_h * 0.05, 1.0)
+    bands = {}
+    for cue in cues:
+        key = int(cue.get("y", frame_h / 2) / band_px)
+        bands.setdefault(key, []).append(cue)
+    
+    result = []
+    for band_cues in bands.values():
+        band_cues.sort(key=lambda c: c["start"])
+        
+        merged_band = []
+        cur = band_cues[0].copy()
+        for nxt in band_cues[1:]:
+            gap = nxt["start"] - cur["end"]
+            # Fuzzy match prevents flickering OCR from breaking the merge chain
+            if gap <= max_gap and _same_sub(cur, nxt):
+                cur["end"] = max(cur["end"], nxt["end"])
+                # Adopt the longest clean text as canon
+                if len(_norm(nxt.get("text", ""))) > len(_norm(cur.get("text", ""))):
+                    cur["text"] = nxt["text"]
+                    cur["cmp"] = nxt.get("cmp", "")
+            else:
+                merged_band.append(cur)
+                cur = nxt.copy()
+        merged_band.append(cur)
+        result.extend(merged_band)
+        
+    result.sort(key=lambda c: c["start"])
     return result
 
 def _flatten_paddle_result(result) -> list:
-    """
-    PaddleOCR's .ocr() return shape has changed across versions: some return
-    [line, line, ...] directly, newer ones wrap it as [[line, line, ...]] (one
-    "page" layer). A line is always [box, (text, conf)] where box has >=3 points.
-    Detect which shape we got and unwrap if needed, instead of hardcoding one.
-    """
     if not result:
         return []
     first = result[0]
     if (isinstance(first, list) and first
             and isinstance(first[0], (list, tuple)) and len(first[0]) == 2
             and isinstance(first[0][0], (list, tuple)) and len(first[0][0]) >= 3):
-        return first  # result[0] was itself the list of lines -> unwrap
+        return first  
     return result
 
 def _extract_text_paddle(engine, frame: np.ndarray) -> list:
@@ -555,7 +570,6 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
 # ══════════════════════════════════════════════════════════════════════════════
 def _make_extract_cmd(video_path: str, ss: float, dur: float,
                        s_w: int, s_h: int, extract_fps: float, thr: str = "2") -> list:
-    """Module-level so it's picklable — spawned worker processes build their own command."""
     return [
         "ffmpeg", "-v", "error", "-y",
         "-hwaccel", "cuda",
@@ -573,12 +587,6 @@ def _make_extract_cmd(video_path: str, ss: float, dur: float,
 def _mp_ocr_worker(idx: int, video_path: str, ss: float, dur: float,
                     bpf: int, s_w: int, s_h: int, extract_fps: float,
                     progress_q, result_q, cancel_val):
-    """
-    Entry point for a spawned OCR worker PROCESS (not thread). Runs in its own
-    interpreter with its own CUDA context, so _load_ocr(0) here gives this
-    process a genuinely separate PaddleOCR instance — no shared-engine
-    contention with the other 3 workers.
-    """
     try:
         engine = _load_ocr(0)
         cmd = _make_extract_cmd(video_path, ss, dur, s_w, s_h, extract_fps)
@@ -619,7 +627,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     end_sec   = min(end_sec if end_sec is not None else duration, duration)
     proc_dur  = end_sec - start_sec
 
-    # Extract exactly at native video FPS to scan EVERY single frame
     extract_fps = fps
     total_frames = int(proc_dur * extract_fps)
 
@@ -631,7 +638,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     bpf   = s_w * s_h * 3
     t0 = time.time()
 
-    NUM_WORKERS = 8
+    NUM_WORKERS = 4
 
     push(status_msg,
          f"⚡ **Multi-Process Full Frame OCR** — {s_w}×{s_h} @ {extract_fps:.2f} fps\n"
@@ -683,12 +690,10 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
 
     while any(p.is_alive() for p in procs) or results_received < NUM_WORKERS:
         if cancel_check() and cancel_val.value == 0:
-            cancel_val.value = 1   # signal every worker process to stop
+            cancel_val.value = 1   
         
         _drain_progress()
         
-        # --- THE DEADLOCK FIX ---
-        # Drain the result queue continuously to prevent pipe buffer overflow
         while True:
             try:
                 gi, cues = result_q.get_nowait()
@@ -718,7 +723,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     for p in procs:
         if p.is_alive(): p.terminate()
 
-    # Combine and correctly clip the overlaps
     raw = []
     for i in range(NUM_WORKERS):
         chunk_end = start_sec + ((i + 1) * chunk_dur)
@@ -729,8 +733,8 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
             
     raw.sort(key=lambda x: x["start"])
 
-    # Final Merge based on requested Notebook Logic
-    raw = merge_by_exact_text(raw, max_gap=0.5)
+    # Spatial grouped merging logic preventing ASS dumps
+    raw = group_and_merge(raw, s_h, max_gap=0.5)
     return raw, s_w, s_h
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -824,7 +828,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         trans_tag = r"{\fs45\c&HD0D0D0&}"
 
-        # Dialogue processing (Default styling)
         if y > (play_y * 0.80):
             if en_clean:
                 text = f"{zh}\\N{trans_tag}{en_clean}"
@@ -832,7 +835,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 text = zh
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
         else:
-            # Special Intro/Moves processing (Upper area)
             is_vertical = bh > (bw * 1.5)
 
             if is_vertical:
@@ -1327,15 +1329,15 @@ def deactivate_machine():
 @app.on_message(filters.command("start"))
 async def cmd_start(c, m: Message):
     await m.reply_text(
-        "🎬 **TheFrictionRealm — Lightning AI Bot v4.2**\n\n"
+        "🎬 **TheFrictionRealm — Lightning AI Bot v4.3**\n\n"
         "🔬 **OCR:** Max-Batch GPU Scan 100% Frame @ NATIVE FPS\n"
-        "📄 **Subs:** Exact ASS Layout + Vertical Detection\n"
+        "📄 **Subs:** Exact ASS Layout + Spatial Merging\n"
         "🎞 **Encode:** hevc_nvenc p7 + multipass fullres + cq19\n\n"
         "**Commands:**\n"
         "  `/ocr` — OCR → Translate → ASS → Mux → Encode\n"
         "  `/enc` — Direct encode 2K / 1080p / 720p\n"
         "  `/log <id>` — Re-encode cached video\n"
-        "  `/clean` — Clean an uploaded .srt file\n"
+        "  `/clean` — Clean an uploaded .srt or .ass file\n"
         "  `/cancel` · `/status` · `/shutdown`\n\n"
         "_Reply to a video or include a URL._"
     )
@@ -1403,7 +1405,7 @@ async def cmd_shutdown(c, m: Message):
     await m.reply("🛑 Shutting down Lightning AI server…")
     deactivate_machine()
 
-# ── /clean Logic ──────────────────────────────────────────────────────────────
+# ── /clean Logic (SRT + ASS files) ────────────────────────────────────────────
 def _ts_to_sec(ts: str) -> float:
     ts = ts.replace(",", ".")
     h, m, s = ts.split(":")
@@ -1415,6 +1417,12 @@ def _sec_to_ts(sec: float) -> str:
     s  = sec % 60
     ms = round((s % 1) * 1000)
     return f"{h:02d}:{m:02d}:{int(s):02d},{ms:03d}"
+
+def _ass_time_to_sec(t_str: str) -> float:
+    try:
+        h, m, s = t_str.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except: return 0.0
 
 def parse_srt(text: str) -> list:
     cues = []
@@ -1436,41 +1444,78 @@ def cues_to_srt(cues: list) -> str:
         out.append(f"{i}\n{_sec_to_ts(c['start'])} --> {_sec_to_ts(c['end'])}\n{c['text']}\n")
     return "\n".join(out)
 
-def clean_srt_file(text: str, max_gap: float = 0.5, wm_min_dur: float = 300.0) -> tuple:
+def clean_srt_file(text: str, wm_min_dur: float = 300.0) -> tuple:
     from collections import defaultdict
     cues = parse_srt(text)
     if not cues: return text, 0, 0
-    merged = []
-    cur = cues[0].copy(); cur_key = _norm(cur["text"])
-    for nxt in cues[1:]:
-        nxt_key = _norm(nxt["text"])
-        if nxt_key == cur_key and nxt["start"] - cur["end"] <= max_gap:
-            cur["end"] = max(cur["end"], nxt["end"])
-        else:
-            merged.append(cur); cur = nxt.copy(); cur_key = nxt_key
-    merged.append(cur)
     dur_map: dict = defaultdict(float)
-    for c in merged: dur_map[_norm(c["text"])] += c["end"] - c["start"]
+    for c in cues: dur_map[_norm(c["text"])] += c["end"] - c["start"]
     blacklist = {k for k, v in dur_map.items() if k and v >= wm_min_dur}
-    cleaned = [c for c in merged if _norm(c["text"]) not in blacklist]
+    cleaned = [c for c in cues if _norm(c["text"]) not in blacklist]
     return cues_to_srt(cleaned), len(cues), len(cleaned)
+
+def clean_ass_file(text: str, wm_min_dur: float = 300.0) -> tuple:
+    lines = text.splitlines()
+    from collections import defaultdict
+    dur_map = defaultdict(float)
+    
+    for line in lines:
+        if line.startswith("Dialogue:"):
+            parts = line.split(",", 9)
+            if len(parts) >= 10:
+                start_sec = _ass_time_to_sec(parts[1].strip())
+                end_sec   = _ass_time_to_sec(parts[2].strip())
+                raw_txt   = parts[9]
+                clean_txt = _norm(re.sub(r"\{.*?\}", "", raw_txt).replace("\\N", ""))
+                if len(clean_txt) >= 3: 
+                    dur_map[clean_txt] += (end_sec - start_sec)
+                
+    blacklist = {k for k, v in dur_map.items() if k and v >= wm_min_dur}
+    
+    out_lines = []
+    removed = 0
+    total = 0
+    
+    for line in lines:
+        if line.startswith("Dialogue:"):
+            total += 1
+            parts = line.split(",", 9)
+            if len(parts) >= 10:
+                raw_txt   = parts[9]
+                clean_txt = _norm(re.sub(r"\{.*?\}", "", raw_txt).replace("\\N", ""))
+                if clean_txt in blacklist:
+                    removed += 1
+                    continue
+        out_lines.append(line)
+        
+    return "\n".join(out_lines), total, total - removed
 
 @app.on_message(filters.command("clean") & filters.private)
 async def cmd_clean(c, m: Message):
     reply = m.reply_to_message
     if not reply or not reply.document:
-        return await m.reply("↩️ Reply to a **.srt** file with `/clean`")
-    if not (reply.document.file_name or "").lower().endswith(".srt"):
-        return await m.reply("Only **.srt** files are supported.")
+        return await m.reply("↩️ Reply to a **.srt** or **.ass** file with `/clean`")
     
-    msg  = await m.reply("⚙️ Cleaning SRT…")
+    fname = (reply.document.file_name or "").lower()
+    if not (fname.endswith(".srt") or fname.endswith(".ass")):
+        return await m.reply("Only **.srt** and **.ass** files are supported.")
+    
+    msg  = await m.reply("⚙️ Cleaning file…")
     path = Path(await reply.download())
     try:
-        raw           = path.read_text(encoding="utf-8", errors="replace")
-        cleaned, b, a = clean_srt_file(raw)
-        saved         = b - a
-        out           = path.with_stem(path.stem + "_clean")
-        out.write_text(cleaned, encoding="utf-8")
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        
+        if fname.endswith(".srt"):
+            cleaned, b, a = clean_srt_file(raw)
+            encoding_out = "utf-8"
+        else:
+            cleaned, b, a = clean_ass_file(raw)
+            encoding_out = "utf-8-sig" # Keeps BOM for ASS files
+            
+        saved = b - a
+        out   = path.with_stem(path.stem + "_clean")
+        out.write_text(cleaned, encoding=encoding_out)
+        
         await msg.edit(f"✅ **Done** — {b} → {a} cues (**{saved}** removed)")
         await c.send_document(m.chat.id, str(out), caption=f"🧹 {out.name}")
     except Exception as e:
@@ -1845,8 +1890,8 @@ async def start_stream_server():
 async def main():
     global EVENT_LOOP
     EVENT_LOOP = asyncio.get_running_loop()
-    log.info("TheFrictionRealm Lightning AI Bot v4.2 — starting…")
-    log.info(f"GPUs: {NUM_GPUS} | Encode semaphore: 2 concurrent | Full-frame OCR")
+    log.info("TheFrictionRealm Lightning AI Bot v4.3 — starting…")
+    log.info(f"GPUs: {NUM_GPUS} | Encode semaphore: 3 concurrent | Full-frame OCR")
     await app.start()
     await start_stream_server()
     log.info("✅ Bot ready!")
