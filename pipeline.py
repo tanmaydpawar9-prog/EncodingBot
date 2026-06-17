@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-TheFrictionRealm — Lightning AI Unified Bot v4.1 (RTX 6000 Ada Max Juice)
-GPU  : RTX 6000 Ada (Hyper-Parallel 4-Thread OCR, 96 GB VRAM Maxed)
-OCR  : EasyOCR Full Frame 100% Scan @ NATIVE FPS (Every single frame)
+TheFrictionRealm — Lightning AI Unified Bot v4.2 (RTX PRO 6000 Blackwell Max Juice)
+GPU  : RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7 ECC, 4x NVENC, 4x NVDEC)
+       — 4 independent OCR PROCESSES, real parallel GPU usage
+OCR  : PaddleOCR Full Frame 100% Scan @ NATIVE FPS (Every single frame)
 Subs : Clean .ASS with requested custom style + Vertical detection
 Enc  : hevc_nvenc p7 + multipass fullres + cq19 + maxed AQ
 """
@@ -25,6 +26,14 @@ except ImportError:
 import re, time, json, shutil, asyncio, logging, subprocess
 import difflib, threading, queue, traceback, io, uuid
 import http.server, socketserver, concurrent.futures
+import multiprocessing as mp
+
+# CUDA + multiprocessing requires 'spawn' (fork would inherit a half-initialised
+# CUDA context from the parent process and hang/crash). Each spawned child gets
+# its own clean interpreter, its own CUDA context, its own OCR engine instance —
+# this is what actually gives you parallel GPU throughput instead of N threads
+# fighting the GIL over one shared model object.
+_MP_CTX = mp.get_context("spawn")
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -158,7 +167,7 @@ QUALITY_SPECS = [
     QualitySpec("720p",  1280,  720),
 ]
 
-_encode_sem = asyncio.Semaphore(2)
+_encode_sem = asyncio.Semaphore(3)  # 4x NVENC engines on this card — all 3 quality profiles can run truly in parallel
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  State machine
@@ -371,37 +380,42 @@ app = Client(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  OCR engine  — EasyOCR Max Batch
+#  OCR engine  — PaddleOCR (each worker PROCESS loads its own instance)
 # ══════════════════════════════════════════════════════════════════════════════
+# NOTE: this module-level dict is intentionally process-local. Under the
+# 'spawn' multiprocessing context every worker process re-imports this module
+# from scratch, so each one gets its own empty _OCR_ENGINES dict and therefore
+# its own PaddleOCR instance / CUDA context. That's what makes the parallelism
+# in run_ocr_pipeline() real instead of 4 threads sharing one model object.
 def _load_ocr(gpu_id: int = 0):
     if gpu_id not in _OCR_ENGINES:
-        import easyocr
-        import torch
-        
-        if torch.cuda.is_available():
-            # Maximize performance on RTX Ada Architecture
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            
-        device_str = f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
-        try:
-            log.info(f"EasyOCR init — GPU:{gpu_id} ({device_str}) TF32 Enabled")
-            reader = easyocr.Reader(
-                ['ch_sim', 'en'], 
-                gpu=torch.cuda.is_available(),
-                quantize=False
-            )
-            if torch.cuda.is_available():
-                reader.device = device_str
-                
-            _OCR_ENGINES[gpu_id] = reader
-            log.info(f"EasyOCR ready GPU:{gpu_id}")
-            
-        except Exception as e:
-            log.warning(f"GPU OCR init failed: {e}")
-            log.warning("Falling back to CPU EasyOCR")
-            _OCR_ENGINES[gpu_id] = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+        from paddleocr import PaddleOCR
+
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                log.info(f"PaddleOCR init — GPU:{gpu_id} (pid={os.getpid()}, attempt {attempt}/3)")
+                _OCR_ENGINES[gpu_id] = PaddleOCR(
+                    use_angle_cls=False,   # subtitles are upright, skip the rotation classifier
+                    lang="ch",             # ch model covers ch_sim + latin/digits, same coverage as easyocr ['ch_sim','en']
+                    use_gpu=True,
+                    gpu_id=gpu_id,
+                    show_log=False,
+                    det_db_box_thresh=0.5,
+                    rec_batch_num=32,      # batch the recognition crops within one frame
+                    cpu_threads=4,
+                )
+                log.info(f"PaddleOCR ready GPU:{gpu_id} (pid={os.getpid()})")
+                break
+            except Exception as e:
+                last_err = e
+                log.warning(f"PaddleOCR init attempt {attempt} failed: {e}")
+                shutil.rmtree(os.path.expanduser("~/.paddleocr"), ignore_errors=True)
+                time.sleep(2)
+        else:
+            log.warning(f"GPU OCR init failed after 3 attempts: {last_err}")
+            log.warning("Falling back to CPU PaddleOCR")
+            _OCR_ENGINES[gpu_id] = PaddleOCR(use_angle_cls=False, lang="ch", use_gpu=False, show_log=False)
             
     return _OCR_ENGINES[gpu_id]
 
@@ -434,28 +448,42 @@ def merge_by_exact_text(cues: list, max_gap: float = 0.5) -> list:
     result.append(cur)
     return result
 
-def _extract_text_easyocr(engine, frame: np.ndarray) -> list:
+def _flatten_paddle_result(result) -> list:
+    """
+    PaddleOCR's .ocr() return shape has changed across versions: some return
+    [line, line, ...] directly, newer ones wrap it as [[line, line, ...]] (one
+    "page" layer). A line is always [box, (text, conf)] where box has >=3 points.
+    Detect which shape we got and unwrap if needed, instead of hardcoding one.
+    """
+    if not result:
+        return []
+    first = result[0]
+    if (isinstance(first, list) and first
+            and isinstance(first[0], (list, tuple)) and len(first[0]) == 2
+            and isinstance(first[0][0], (list, tuple)) and len(first[0][0]) >= 3):
+        return first  # result[0] was itself the list of lines -> unwrap
+    return result
+
+def _extract_text_paddle(engine, frame: np.ndarray) -> list:
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     unique_lines = []
-    
+
     try:
-        res = engine.readtext(
-            img_rgb, 
-            paragraph=False,
-            batch_size=32,       # Max VRAM utilization
-            mag_ratio=1.0,       # 1.0 is fast and accurate enough for 1080p
-            text_threshold=0.5,
-            low_text=0.35,
-            width_ths=0.7
-        )
+        result = engine.ocr(img_rgb, cls=False)
     except Exception as e:
         log.debug(f"OCR pass error: {e}")
         return []
-        
-    for pts, text, conf in res:
-        if conf < 0.15: 
+
+    for item in _flatten_paddle_result(result):
+        if not item or len(item) != 2:
             continue
-        full_frame_pts = [[float(p[0]), float(p[1])] for p in pts]
+        box, txt_conf = item
+        if not txt_conf or len(txt_conf) != 2:
+            continue
+        text, conf = txt_conf
+        if conf is None or conf < 0.15:
+            continue
+        full_frame_pts = [[float(p[0]), float(p[1])] for p in box]
         unique_lines.append((full_frame_pts, (text, conf)))
 
     return unique_lines
@@ -503,7 +531,7 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
         if mx < 50:
             continue
 
-        lines = _extract_text_easyocr(engine, frame)
+        lines = _extract_text_paddle(engine, frame)
 
         for pts, (raw_text, conf) in lines:
             if conf < 0.15: continue
@@ -526,6 +554,48 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
 
     proc.stdout.close(); proc.wait()
     return cues
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Picklable helpers for spawned OCR worker processes
+# ══════════════════════════════════════════════════════════════════════════════
+def _make_extract_cmd(video_path: str, ss: float, dur: float,
+                       s_w: int, s_h: int, extract_fps: float, thr: str = "2") -> list:
+    """Module-level so it's picklable — spawned worker processes build their own command."""
+    return [
+        "ffmpeg", "-v", "error", "-y",
+        "-hwaccel", "cuda",
+        "-threads", thr,
+        "-ss", str(ss), "-i", video_path, "-t", str(dur),
+        "-vf", f"scale={s_w}:{s_h}:flags=lanczos",
+        "-r", str(extract_fps),
+        "-s", f"{s_w}x{s_h}",
+        "-f", "image2pipe",
+        "-pix_fmt", "bgr24",
+        "-vcodec", "rawvideo",
+        "-"
+    ]
+
+def _mp_ocr_worker(idx: int, video_path: str, ss: float, dur: float,
+                    bpf: int, s_w: int, s_h: int, extract_fps: float,
+                    progress_q, result_q, cancel_val):
+    """
+    Entry point for a spawned OCR worker PROCESS (not thread). Runs in its own
+    interpreter with its own CUDA context, so _load_ocr(0) here gives this
+    process a genuinely separate PaddleOCR instance — no shared-engine
+    contention with the other 3 workers.
+    """
+    try:
+        engine = _load_ocr(0)
+        cmd = _make_extract_cmd(video_path, ss, dur, s_w, s_h, extract_fps)
+        cancel_check = lambda: cancel_val.value != 0
+        cues = _process_frame_stream(
+            engine, cmd, bpf, s_h, s_w, extract_fps, ss, cancel_check,
+            progress_cb=lambda fi, cl: progress_q.put((idx, fi, len(cl))),
+        )
+        result_q.put((idx, cues))
+    except Exception:
+        log.exception(f"OCR worker {idx} crashed")
+        result_q.put((idx, []))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Hyper-Parallel Full-frame OCR pipeline
@@ -555,43 +625,33 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     proc_dur  = end_sec - start_sec
 
     # Extract exactly at native video FPS to scan EVERY single frame
-    extract_fps = fps  
+    extract_fps = fps
     total_frames = int(proc_dur * extract_fps)
 
-    # Full frame mapped cleanly
-    scale = min(1920, orig_w) / max(orig_w, 1)
-    s_w   = (int(orig_w * scale) >> 1) << 1   
+    # Full frame mapped cleanly. 1280px width is the speed/accuracy sweet spot
+    # from earlier testing — subtitle text is still easily legible at this
+    # resolution and OCR cost scales with pixel count. Raise this back up only
+    # if you're actually missing very small on-screen text.
+    OCR_SCAN_WIDTH = 1280
+    scale = min(OCR_SCAN_WIDTH, orig_w) / max(orig_w, 1)
+    s_w   = (int(orig_w * scale) >> 1) << 1
     s_h   = (int(orig_h * scale) >> 1) << 1
 
     bpf   = s_w * s_h * 3
     t0 = time.time()
 
-    # 96GB VRAM supports 4 parallel processing threads hitting the RTX 6000 Ada core
-    # at once to break the Python GIL bottleneck.
-    NUM_WORKERS = 4 
+    # 4 independent OCR worker PROCESSES (not threads). Each gets its own
+    # PaddleOCR instance + CUDA context, so they genuinely run concurrently on
+    # the GPU instead of 4 threads fighting over one shared model + the GIL.
+    NUM_WORKERS = 4
 
     push(status_msg,
-         f"⚡ **Hyper-Parallel Full Frame OCR** — {s_w}×{s_h} @ {extract_fps:.2f} fps\n"
-         f"🚀 Max Juice: {NUM_WORKERS} Concurrent GPU Threads\n"
+         f"⚡ **Multi-Process Full Frame OCR** — {s_w}×{s_h} @ {extract_fps:.2f} fps\n"
+         f"🚀 {NUM_WORKERS} independent GPU worker processes\n"
          f"Scanning 100% of {total_frames:,} frames…",
          CANCEL_BTN)
 
-    def make_cmd(ss: float, dur: float, thr: str = "4") -> list:
-        return [
-            "ffmpeg", "-v", "error", "-y",
-            "-hwaccel", "cuda",
-            "-threads", thr,
-            "-ss", str(ss), "-i", video_path, "-t", str(dur),
-            "-vf", f"scale={s_w}:{s_h}:flags=lanczos",
-            "-r", str(extract_fps),
-            "-s", f"{s_w}x{s_h}",
-            "-f", "image2pipe",
-            "-pix_fmt", "bgr24",
-            "-vcodec", "rawvideo",
-            "-"
-        ]
-
-    _test_cmd = make_cmd(start_sec, min(2.0, proc_dur))
+    _test_cmd = _make_extract_cmd(video_path, start_sec, min(2.0, proc_dur), s_w, s_h, extract_fps)
     _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=bpf * 4)
     _raw = _tp.stdout.read(bpf)
     _tp.stdout.close(); _tp.wait()
@@ -599,53 +659,70 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
         _err = _tp.stderr.read(2000).decode(errors="replace")
         raise RuntimeError(f"FFmpeg pipe geometry mismatch. stderr:\n{_err}")
 
-    # Launch Parallel Engine
-    engines = [_load_ocr(0) for _ in range(NUM_WORKERS)]
-    seg     = [[] for _ in range(NUM_WORKERS)]
-    _prog   = [0] * NUM_WORKERS
+    # Launch the real parallel engine: one OS process per worker, each with
+    # its own model instance. This is what actually uses the GPU's spare
+    # compute capacity instead of serialising on one engine.
+    progress_q = _MP_CTX.Queue()
+    result_q   = _MP_CTX.Queue()
+    cancel_val = _MP_CTX.Value("i", 0)
+
+    seg      = [[] for _ in range(NUM_WORKERS)]
+    _prog    = [0] * NUM_WORKERS
     _cues_ct = [0] * NUM_WORKERS
-    lock = threading.Lock()
 
-    def _cb(gi):
-        def _f(fi, cl):
-            with lock: 
-                _prog[gi] = fi
-                _cues_ct[gi] = len(cl)
-        return _f
-
-    def _worker(i, eng, ss, dur):
-        seg[i] = _process_frame_stream(eng, make_cmd(ss, dur, "4"), bpf, s_h, s_w, extract_fps, ss, cancel_check, _cb(i))
-
-    threads = []
     chunk_dur = proc_dur / NUM_WORKERS
-    
+    procs = []
     for i in range(NUM_WORKERS):
         chunk_start = start_sec + (i * chunk_dur)
         # 1 second overlap to avoid cutting a subtitle in half at the chunk boundary
         chunk_length = chunk_dur + 1.0 if i < NUM_WORKERS - 1 else chunk_dur
-        th = threading.Thread(target=_worker, args=(i, engines[i], chunk_start, chunk_length), daemon=True)
-        th.start()
-        threads.append(th)
+        p = _MP_CTX.Process(
+            target=_mp_ocr_worker,
+            args=(i, video_path, chunk_start, chunk_length, bpf, s_w, s_h, extract_fps,
+                  progress_q, result_q, cancel_val),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+
+    def _drain_progress():
+        while True:
+            try:
+                gi, fi, cl_len = progress_q.get_nowait()
+            except queue.Empty:
+                break
+            _prog[gi] = fi
+            _cues_ct[gi] = cl_len
 
     last_ui = time.time()
-    while any(th.is_alive() for th in threads):
-        if cancel_check(): break
+    while any(p.is_alive() for p in procs):
+        if cancel_check() and cancel_val.value == 0:
+            cancel_val.value = 1   # signal every worker process to stop
+        _drain_progress()
         if time.time() - last_ui > REFRESH:
             last_ui = time.time()
-            with lock: 
-                total_p = sum(_prog)
-                total_c = sum(_cues_ct)
-                progress_str = " | ".join([f"W{i}:{_prog[i]}" for i in range(NUM_WORKERS)])
-            
+            total_p = sum(_prog)
+            total_c = sum(_cues_ct)
+            progress_str = " | ".join([f"W{i}:{_prog[i]}" for i in range(NUM_WORKERS)])
             fps_actual = total_p / max(time.time() - t0, 0.01)
             push(status_msg,
-                 pb_frames("⚡ Max-Juice Parallel OCR", total_p, total_frames, t0,
-                            f"💬 Cues: {total_c} | GPU Throttle: {fps_actual:.0f} fps\n"
+                 pb_frames("⚡ Multi-Process Parallel OCR", total_p, total_frames, t0,
+                            f"💬 Cues: {total_c} | GPU Throughput: {fps_actual:.0f} fps\n"
                             f"⚙️ {progress_str}"),
                  CANCEL_BTN)
         time.sleep(0.5)
 
-    for th in threads: th.join()
+    for p in procs: p.join(timeout=15)
+    for p in procs:
+        if p.is_alive(): p.terminate()
+
+    _drain_progress()
+    for _ in range(NUM_WORKERS):
+        try:
+            gi, cues = result_q.get(timeout=20)
+            seg[gi] = cues
+        except queue.Empty:
+            log.warning("An OCR worker process never returned a result — treating it as empty")
 
     # Combine and correctly clip the overlaps
     raw = []
