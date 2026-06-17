@@ -861,7 +861,7 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
 
         if same_text and same_style and gap <= max_gap:
             cur["end"] = max(cur["end"], item["end"])
-            cur["parts"][2] = _sec_to_ass_time(cur["end"])
+            cur["parts"][2] = ass_ts(cur["end"])
             cur["raw_line"] = ",".join(cur["parts"])
         else:
             out.append(cur["raw_line"])
