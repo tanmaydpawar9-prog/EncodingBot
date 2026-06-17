@@ -382,11 +382,6 @@ app = Client(
 # ══════════════════════════════════════════════════════════════════════════════
 #  OCR engine  — PaddleOCR (each worker PROCESS loads its own instance)
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTE: this module-level dict is intentionally process-local. Under the
-# 'spawn' multiprocessing context every worker process re-imports this module
-# from scratch, so each one gets its own empty _OCR_ENGINES dict and therefore
-# its own PaddleOCR instance / CUDA context. That's what makes the parallelism
-# in run_ocr_pipeline() real instead of 4 threads sharing one model object.
 def _load_ocr(gpu_id: int = 0):
     if gpu_id not in _OCR_ENGINES:
         from paddleocr import PaddleOCR
@@ -628,10 +623,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     extract_fps = fps
     total_frames = int(proc_dur * extract_fps)
 
-    # Full frame mapped cleanly. 1280px width is the speed/accuracy sweet spot
-    # from earlier testing — subtitle text is still easily legible at this
-    # resolution and OCR cost scales with pixel count. Raise this back up only
-    # if you're actually missing very small on-screen text.
     OCR_SCAN_WIDTH = 1280
     scale = min(OCR_SCAN_WIDTH, orig_w) / max(orig_w, 1)
     s_w   = (int(orig_w * scale) >> 1) << 1
@@ -640,9 +631,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     bpf   = s_w * s_h * 3
     t0 = time.time()
 
-    # 4 independent OCR worker PROCESSES (not threads). Each gets its own
-    # PaddleOCR instance + CUDA context, so they genuinely run concurrently on
-    # the GPU instead of 4 threads fighting over one shared model + the GIL.
     NUM_WORKERS = 4
 
     push(status_msg,
@@ -659,9 +647,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
         _err = _tp.stderr.read(2000).decode(errors="replace")
         raise RuntimeError(f"FFmpeg pipe geometry mismatch. stderr:\n{_err}")
 
-    # Launch the real parallel engine: one OS process per worker, each with
-    # its own model instance. This is what actually uses the GPU's spare
-    # compute capacity instead of serialising on one engine.
     progress_q = _MP_CTX.Queue()
     result_q   = _MP_CTX.Queue()
     cancel_val = _MP_CTX.Value("i", 0)
@@ -674,7 +659,6 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     procs = []
     for i in range(NUM_WORKERS):
         chunk_start = start_sec + (i * chunk_dur)
-        # 1 second overlap to avoid cutting a subtitle in half at the chunk boundary
         chunk_length = chunk_dur + 1.0 if i < NUM_WORKERS - 1 else chunk_dur
         p = _MP_CTX.Process(
             target=_mp_ocr_worker,
@@ -695,10 +679,24 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
             _cues_ct[gi] = cl_len
 
     last_ui = time.time()
-    while any(p.is_alive() for p in procs):
+    results_received = 0
+
+    while any(p.is_alive() for p in procs) or results_received < NUM_WORKERS:
         if cancel_check() and cancel_val.value == 0:
             cancel_val.value = 1   # signal every worker process to stop
+        
         _drain_progress()
+        
+        # --- THE DEADLOCK FIX ---
+        # Drain the result queue continuously to prevent pipe buffer overflow
+        while True:
+            try:
+                gi, cues = result_q.get_nowait()
+                seg[gi] = cues
+                results_received += 1
+            except queue.Empty:
+                break
+
         if time.time() - last_ui > REFRESH:
             last_ui = time.time()
             total_p = sum(_prog)
@@ -710,19 +708,15 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
                             f"💬 Cues: {total_c} | GPU Throughput: {fps_actual:.0f} fps\n"
                             f"⚙️ {progress_str}"),
                  CANCEL_BTN)
+                 
+        if not any(p.is_alive() for p in procs) and result_q.empty():
+            break
+            
         time.sleep(0.5)
 
-    for p in procs: p.join(timeout=15)
+    for p in procs: p.join(timeout=10)
     for p in procs:
         if p.is_alive(): p.terminate()
-
-    _drain_progress()
-    for _ in range(NUM_WORKERS):
-        try:
-            gi, cues = result_q.get(timeout=20)
-            seg[gi] = cues
-        except queue.Empty:
-            log.warning("An OCR worker process never returned a result — treating it as empty")
 
     # Combine and correctly clip the overlaps
     raw = []
@@ -1333,7 +1327,7 @@ def deactivate_machine():
 @app.on_message(filters.command("start"))
 async def cmd_start(c, m: Message):
     await m.reply_text(
-        "🎬 **TheFrictionRealm — Lightning AI Bot v4.1**\n\n"
+        "🎬 **TheFrictionRealm — Lightning AI Bot v4.2**\n\n"
         "🔬 **OCR:** Max-Batch GPU Scan 100% Frame @ NATIVE FPS\n"
         "📄 **Subs:** Exact ASS Layout + Vertical Detection\n"
         "🎞 **Encode:** hevc_nvenc p7 + multipass fullres + cq19\n\n"
@@ -1616,7 +1610,7 @@ async def _run_ocr(c, m: Message, task: Task):
 
         # 3. Full-frame OCR
         task.stage = Stage.OCR_RUNNING
-        await safe_edit(status, "⚡ **Max Batch OCR running…**\nRTX 6000 Ada scanning frames…", CANCEL_BTN)
+        await safe_edit(status, "⚡ **Multi-Process OCR running…**\nRTX 6000 Ada scanning frames…", CANCEL_BTN)
         ocr_result = await asyncio.to_thread(
             run_ocr_pipeline, str(task.input_path), status, chat_id,
             start_sec, end_sec, lambda: task.cancel_flag.is_set()
@@ -1851,7 +1845,7 @@ async def start_stream_server():
 async def main():
     global EVENT_LOOP
     EVENT_LOOP = asyncio.get_running_loop()
-    log.info("TheFrictionRealm Lightning AI Bot v4.1 — starting…")
+    log.info("TheFrictionRealm Lightning AI Bot v4.2 — starting…")
     log.info(f"GPUs: {NUM_GPUS} | Encode semaphore: 2 concurrent | Full-frame OCR")
     await app.start()
     await start_stream_server()
