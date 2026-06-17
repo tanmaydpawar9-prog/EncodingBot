@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TheFrictionRealm — Lightning AI Unified Bot v4.0 (RTX 6000 Ada Max Juice)
+TheFrictionRealm — Lightning AI Unified Bot v4.1 (RTX 6000 Ada Max Juice)
 GPU  : RTX 6000 Ada (Hyper-Parallel 4-Thread OCR, 96 GB VRAM Maxed)
-OCR  : EasyOCR Full Frame 100% Scan @ 8 FPS (Standard Subtitle FPS)
+OCR  : EasyOCR Full Frame 100% Scan @ NATIVE FPS (Every single frame)
 Subs : Clean .ASS with requested custom style + Vertical detection
 Enc  : hevc_nvenc p7 + multipass fullres + cq19 + maxed AQ
 """
@@ -544,6 +544,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     if cancel_check is None: cancel_check = lambda: False
 
     cap    = cv2.VideoCapture(video_path)
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 24.0
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
@@ -553,12 +554,11 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     end_sec   = min(end_sec if end_sec is not None else duration, duration)
     proc_dur  = end_sec - start_sec
 
-    # Max Juice Fix 1: Subtitles stay on screen for >0.5s. 
-    # Extracting at 8 fps drops total frames by 3x while missing NOTHING.
-    extract_fps = 8.0  
+    # Extract exactly at native video FPS to scan EVERY single frame
+    extract_fps = fps  
     total_frames = int(proc_dur * extract_fps)
 
-    # Max Juice Fix 2: Full frame mapped cleanly
+    # Full frame mapped cleanly
     scale = min(1920, orig_w) / max(orig_w, 1)
     s_w   = (int(orig_w * scale) >> 1) << 1   
     s_h   = (int(orig_h * scale) >> 1) << 1
@@ -566,14 +566,14 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     bpf   = s_w * s_h * 3
     t0 = time.time()
 
-    # Max Juice Fix 3: 96GB VRAM can easily support 4 parallel processing threads 
-    # hitting the RTX 6000 Ada core at once to break the Python GIL bottleneck.
+    # 96GB VRAM supports 4 parallel processing threads hitting the RTX 6000 Ada core
+    # at once to break the Python GIL bottleneck.
     NUM_WORKERS = 4 
 
     push(status_msg,
-         f"⚡ **Hyper-Parallel Full Frame OCR** — {s_w}×{s_h} @ {extract_fps} fps\n"
+         f"⚡ **Hyper-Parallel Full Frame OCR** — {s_w}×{s_h} @ {extract_fps:.2f} fps\n"
          f"🚀 Max Juice: {NUM_WORKERS} Concurrent GPU Threads\n"
-         f"Scanning {total_frames:,} frames…",
+         f"Scanning 100% of {total_frames:,} frames…",
          CANCEL_BTN)
 
     def make_cmd(ss: float, dur: float, thr: str = "4") -> list:
@@ -1256,8 +1256,8 @@ def deactivate_machine():
 @app.on_message(filters.command("start"))
 async def cmd_start(c, m: Message):
     await m.reply_text(
-        "🎬 **TheFrictionRealm — Lightning AI Bot v4.0**\n\n"
-        "🔬 **OCR:** Max-Batch GPU Scan 100% Frame @ 8 FPS\n"
+        "🎬 **TheFrictionRealm — Lightning AI Bot v4.1**\n\n"
+        "🔬 **OCR:** Max-Batch GPU Scan 100% Frame @ NATIVE FPS\n"
         "📄 **Subs:** Exact ASS Layout + Vertical Detection\n"
         "🎞 **Encode:** hevc_nvenc p7 + multipass fullres + cq19\n\n"
         "**Commands:**\n"
@@ -1774,7 +1774,7 @@ async def start_stream_server():
 async def main():
     global EVENT_LOOP
     EVENT_LOOP = asyncio.get_running_loop()
-    log.info("TheFrictionRealm Lightning AI Bot v4.0 — starting…")
+    log.info("TheFrictionRealm Lightning AI Bot v4.1 — starting…")
     log.info(f"GPUs: {NUM_GPUS} | Encode semaphore: 2 concurrent | Full-frame OCR")
     await app.start()
     await start_stream_server()
