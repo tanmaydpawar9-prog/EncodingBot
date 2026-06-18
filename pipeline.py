@@ -491,6 +491,67 @@ def group_and_merge(cues: list, frame_h: int, max_gap: float = 0.75) -> list:
     # Final sort for subtitle output format
     finished_subs.sort(key=lambda c: c["start"])
     return finished_subs
+
+# ── Overlay consolidation (multi-line letters / scattered same-time text) ────
+def _cluster_by_time_overlap(items: list) -> list:
+    """Group items into clusters where every member overlaps in time with at
+    least one other member of the same cluster (transitive interval merge)."""
+    items_sorted = sorted(items, key=lambda c: c["start"])
+    clusters, cur, cur_end = [], [], None
+    for it in items_sorted:
+        if cur and it["start"] <= cur_end:
+            cur.append(it)
+            cur_end = max(cur_end, it["end"])
+        else:
+            if cur: clusters.append(cur)
+            cur, cur_end = [it], it["end"]
+    if cur: clusters.append(cur)
+    return clusters
+
+def consolidate_overlay_clusters(cues: list, frame_w: int, frame_h: int) -> list:
+    """
+    The bottom-dialogue band is left untouched. Everything above it (intros,
+    on-screen letters/scrolls, etc.) that occurs at overlapping timestamps but
+    at different screen positions — e.g. a multi-line letter where PaddleOCR
+    detects each line as its own scattered box — gets consolidated into ONE
+    block, ordered top-to-bottom/left-to-right, instead of being rendered as
+    separate fragments scattered across their original on-screen positions.
+    """
+    bottom_thr = frame_h * 0.80
+    bottom = [c for c in cues if float(c.get("y", 0)) > bottom_thr]
+    upper  = [c for c in cues if float(c.get("y", 0)) <= bottom_thr]
+
+    merged_upper = []
+    for cluster in _cluster_by_time_overlap(upper):
+        if len(cluster) == 1:
+            merged_upper.append(cluster[0])
+            continue
+
+        cluster.sort(key=lambda c: (float(c.get("y", 0)), float(c.get("x", 0))))
+        seen, lines = set(), []
+        for c in cluster:
+            t = (c.get("text") or "").strip()
+            if not t: continue
+            n = _norm(t)
+            if n in seen: continue
+            seen.add(n)
+            lines.append(t)
+        if not lines:
+            continue
+
+        merged_upper.append({
+            "start": min(c["start"] for c in cluster),
+            "end":   max(c["end"]   for c in cluster),
+            "text":  "\n".join(lines),
+            "x": frame_w / 2.0,
+            "y": frame_h * 0.62,   # marker position; write_smart_ass anchors _cluster subs explicitly
+            "bh": 0,
+            "_cluster": True,
+        })
+
+    out = bottom + merged_upper
+    out.sort(key=lambda c: c["start"])
+    return out
        
 def _flatten_paddle_result(result) -> list:
     if not result:
@@ -894,6 +955,19 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
 
     return "\n".join(out)
        
+FONT_SIZE               = 80
+SUB_MARGIN_V             = 45   # gap between translated subtitle block and the Chinese hardsub — tune directly
+DIALOGUE_LINES_RESERVED  = 2.2  # worst-case lines (en+zh, occasionally wrapped) the bottom dialogue can occupy
+
+def _estimate_half_width(zh: str, en: str) -> float:
+    """Rough rendered-width estimate so we know how far a \\pos anchor can sit
+    from the screen edge before part of the text would render off-screen.
+    CJK glyphs run close to 1:1 width:height at this fontsize; Latin chars
+    are roughly half that. Heuristic, but far better than no clamp at all."""
+    cjk_w = len(zh) * FONT_SIZE * 0.95
+    lat_w = len(en) * FONT_SIZE * 0.50
+    return max(cjk_w, lat_w) / 2.0
+
 def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
     # Exact PlayRes source/2 rule
     play_x = (orig_w // 2) if orig_w else 960
@@ -902,7 +976,15 @@ def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h
     scale_x = play_x / max(frame_w, 1)
     scale_y = play_y / max(frame_h, 1)
 
-    # UPDATED: Fontsize scaled to 80, MarginV scaled to 150 for mobile readability
+    # How high up the bottom-dialogue block can realistically reach (en + zh,
+    # occasionally wrapped). Nothing in the upper region is allowed to render
+    # below this line, or it'll visually collide with the dialogue.
+    dialogue_zone_y = play_y - (SUB_MARGIN_V + DIALOGUE_LINES_RESERVED * FONT_SIZE)
+    # Fixed anchor for consolidated multi-line overlays (e.g. on-screen
+    # letters). Anchored at the BOTTOM of the block so it only grows upward
+    # as more lines get added — it can never drift down into the dialogue zone.
+    cluster_anchor_y = min(play_y * 0.62, dialogue_zone_y)
+
     header = f"""\ufeff[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_x}
@@ -910,7 +992,7 @@ PlayResY: {play_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,80,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,70,90,1,0,1,2,2,2,400,400,150,1
+Style: Default,Arial,{FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,70,90,1,0,1,2,2,2,400,400,{SUB_MARGIN_V},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -927,40 +1009,47 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         y  = float(sub.get("y", frame_h * 0.9)) * scale_y
         bh = float(sub.get("bh", 0)) * scale_y
 
-        # UPDATED: Scaled translation tag up to \fs60 to match the new mobile-friendly proportions
         trans_tag = r"{\fs60\c&HD0D0D0&}"
 
-        # 1. BOTTOM DIALOGUE (Lower 20% of screen)
+        # 1. BOTTOM DIALOGUE (Lower 20% of screen) — unchanged positioning,
+        # just a tighter MarginV now (set above) for less dead space above the hardsub.
         if y > (play_y * 0.80):
-            if en_clean:
-                # English \N Chinese -> English renders ABOVE the Chinese text.
-                # MarginV 150 pushes the whole block above the video's hardsub.
-                text = f"{en_clean}\\N{zh}"
-            else:
-                text = zh
+            text = f"{en_clean}\\N{zh}" if en_clean else zh
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
-            
-        # 2. UPPER 80% NON-DIALOGUE (Moves, Intros)
+            continue
+
+        # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — one
+        # fixed, centered block instead of scattered per-fragment positions.
+        if sub.get("_cluster"):
+            zh_lines = [l for l in sub["text"].split("\n") if l.strip()]
+            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
+            text = f"{{\\an2\\pos({play_x/2:.0f},{cluster_anchor_y:.0f})}}"
+            text += f"{trans_tag}{en_clean}\\N{{\\r}}{zh_block}" if en_clean else zh_block
+            events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
+            continue
+
+        # 3. SINGLE UPPER-SCREEN OVERLAY (intros, scene cards, a lone letter line)
+        half_w = _estimate_half_width(zh, en_clean)
+        safety = FONT_SIZE * 0.5
+        x = min(max(x, half_w + safety), play_x - half_w - safety)  # keep on-screen at the sides
+
+        if y < (play_y * 0.50):
+            y_pos = y + (bh / 2) + (play_y * 0.02)
+            align = r"\an8" 
         else:
-            # Forced horizontal rendering. No vertical \N injections.
-            if y < (play_y * 0.50):
-                # Top half of screen -> Push subtitle slightly BELOW the Chinese hardsub
-                y_pos = y + (bh / 2) + (play_y * 0.02)
-                align = r"\an8" 
-            else:
-                # Middle of screen -> Push subtitle slightly ABOVE the Chinese hardsub
-                y_pos = y - (bh / 2) - (play_y * 0.02)
-                align = r"\an2" 
+            y_pos = y - (bh / 2) - (play_y * 0.02)
+            align = r"\an2" 
+        y_pos = min(y_pos, dialogue_zone_y)   # never let it drop into the dialogue's reserved zone
 
-            if en_clean:
-                if align == r"\an8":
-                    text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}\\N{trans_tag}{en_clean}"
-                else:
-                    text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{trans_tag}{en_clean}\\N{{\\r}}{zh}"
+        if en_clean:
+            if align == r"\an8":
+                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}\\N{trans_tag}{en_clean}"
             else:
-                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}"
+                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{trans_tag}{en_clean}\\N{{\\r}}{zh}"
+        else:
+            text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{zh}"
 
-            events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
+        events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
 
     with open(path, "w", encoding="utf-8-sig") as f:
         f.write(header)
@@ -1231,7 +1320,7 @@ def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
         "-preset",    "p7",           
         "-tune",      "hq",
         "-profile:v", "main",
-        "-level",     "auto",
+        "-level:v",   "auto",
 
         "-rc",         "vbr",
         "-multipass",  "fullres",     
@@ -1774,6 +1863,7 @@ async def _run_ocr(c, m: Message, task: Task):
         if task.cancel_flag.is_set(): raise InterruptedError()
 
         final_subs, ocr_w, ocr_h = ocr_result
+        final_subs = consolidate_overlay_clusters(final_subs, ocr_w, ocr_h)
         task.ocr_subs    = final_subs
         task.ocr_frame_w = ocr_w
         task.ocr_frame_h = ocr_h
