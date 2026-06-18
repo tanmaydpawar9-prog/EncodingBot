@@ -1338,7 +1338,9 @@ def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
         "-bf",           "4",
         "-b_ref_mode",   "middle",
         "-refs",         "4",
-        "-weighted_pred","1",         
+        # weighted_pred removed: hevc_nvenc rejects it outright when B-frames
+        # are enabled ("Weighted prediction is not supported with BFrames").
+        # bf=4 + b_ref_mode=middle give more compression benefit anyway.
 
         "-c:a", "copy",
         *([ "-c:s", "copy"] if has_subs else []),
