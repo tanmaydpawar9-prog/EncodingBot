@@ -955,7 +955,7 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
 
     return "\n".join(out)
        
-FONT_SIZE               = 80
+FONT_SIZE               = 64
 TRANS_FONT_SIZE          = 60   # English translation line size (kept proportionally in sync if shrunk)
 SUB_MARGIN_V             = 45   # fallback only — real dialogue position is now computed from the detected hardsub y
 SAFE_MARGIN              = FONT_SIZE * 0.5   # breathing room kept from either screen edge
