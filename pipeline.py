@@ -539,11 +539,19 @@ def consolidate_overlay_clusters(cues: list, frame_w: int, frame_h: int) -> list
         if not lines:
             continue
 
+        xs = [float(c.get("x", frame_w / 2)) for c in cluster]
+        x_spread = max(xs) - min(xs)
+        # A tight group (e.g. a card with 2 detected lines) keeps its real
+        # screen position. Only fall back to centering when the fragments are
+        # genuinely scattered across the frame (a multi-column letter, where
+        # there's no single coherent position to anchor to anyway).
+        cluster_x = (frame_w / 2.0) if x_spread > frame_w * 0.25 else (sum(xs) / len(xs))
+
         merged_upper.append({
             "start": min(c["start"] for c in cluster),
             "end":   max(c["end"]   for c in cluster),
             "text":  "\n".join(lines),
-            "x": frame_w / 2.0,
+            "x": cluster_x,
             "y": frame_h * 0.62,   # marker position; write_smart_ass anchors _cluster subs explicitly
             "bh": 0,
             "_cluster": True,
@@ -955,31 +963,46 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
 
     return "\n".join(out)
        
-FONT_SIZE               = 64
-TRANS_FONT_SIZE          = 60   # English translation line size (kept proportionally in sync if shrunk)
+FONT_SIZE               = 64    # was 80 — that's ~15% of frame height (big on a PC monitor); 64 (~12%) balances phone and PC viewing
+TRANS_FONT_SIZE          = 48    # kept at the same 0.75 ratio to FONT_SIZE as before
 SUB_MARGIN_V             = 45   # fallback only — real dialogue position is now computed from the detected hardsub y
 SAFE_MARGIN              = FONT_SIZE * 0.5   # breathing room kept from either screen edge
 DIALOGUE_LINES_RESERVED  = 2.2  # worst-case lines (en+zh, occasionally wrapped) the bottom dialogue can occupy
 
-def _fit_scale(text: str, base_fs: float, avail: float, is_cjk: bool) -> float:
+def _wrap_to_fit(text: str, base_fs: float, avail: float, is_cjk: bool, max_lines: int = 2):
     """
-    Scale factor (<=1.0) needed to keep `text` at `base_fs` within `avail`
-    pixels of width, instead of moving its position around (which breaks
-    down badly once a line is simply too wide to fit anywhere safely).
-    Never shrinks below 45% of the original size — past that it's not worth
-    going smaller, and 45% is already small enough to never clip the edges.
+    Wrap `text` into up to `max_lines` lines so each one fits within `avail`
+    at `base_fs`, instead of shrinking the whole thing — wrapping keeps text
+    a normal readable size and just uses more vertical space, which these
+    overlays have room for. Only shrinks (down to a 45% floor) as a last
+    resort, if even `max_lines` isn't enough to make it fit.
+    Returns (lines, fontsize_used).
     """
     if not text:
-        return 1.0
+        return [], base_fs
     factor = 0.95 if is_cjk else 0.50
-    est_w = len(text) * base_fs * factor
-    if est_w <= 0:
-        return 1.0
-    if avail <= 0:
-        return 0.45
-    if est_w <= avail:
-        return 1.0
-    return max(avail / est_w, 0.45)
+
+    def _chunk(fs):
+        per_line = max(int(avail / (fs * factor)), 1) if avail > 0 else 1
+        if is_cjk:
+            return [text[i:i + per_line] for i in range(0, len(text), per_line)]
+        words, lines, cur = text.split(), [], ""
+        for w in words:
+            cand = f"{cur} {w}".strip()
+            if len(cand) <= per_line or not cur:
+                cur = cand
+            else:
+                lines.append(cur); cur = w
+        if cur: lines.append(cur)
+        return lines or [text]
+
+    lines = _chunk(base_fs)
+    if len(lines) <= max_lines:
+        return lines, base_fs
+
+    scale = max(max_lines / len(lines), 0.45)
+    fs = base_fs * scale
+    return _chunk(fs)[:max_lines], fs
 
 def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
     # Exact PlayRes source/2 rule
@@ -1029,38 +1052,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # given video, which is exactly what was causing the overlap.
         if y > (play_y * 0.80):
             avail = play_x - 2 * SAFE_MARGIN
-            scale = _fit_scale(zh, FONT_SIZE, avail, True)
-            if en_clean:
-                scale = min(scale, _fit_scale(en_clean, TRANS_FONT_SIZE, avail, False))
-            zh_ov = f"\\fs{round(FONT_SIZE * scale)}" if scale < 1.0 else ""
-            en_ov = f"\\fs{round(TRANS_FONT_SIZE * scale)}" if scale < 1.0 else ""
+            zh_lines, zh_fs = _wrap_to_fit(zh, FONT_SIZE, avail, True, max_lines=2)
+            zh_block = r"\N".join(zh_lines)
+            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
 
             y_pos = y - (bh / 2) - dialogue_gap if bh > 0 else (play_y - SUB_MARGIN_V - FONT_SIZE)
             y_pos = max(y_pos, play_y * 0.05)   # don't let a bad detection push it off the top either
 
             if en_clean:
+                en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
+                en_block = r"\N".join(en_lines)
+                en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
                 text = (f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f})}}"
-                        f"{{{en_ov}\\c&HD0D0D0&}}{en_clean}\\N{{\\r{zh_ov}}}{zh}")
+                        f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}")
             else:
-                text = f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f}){zh_ov}}}{zh}"
+                text = f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
         # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — one
         # fixed, centered block instead of scattered per-fragment positions.
         if sub.get("_cluster"):
-            zh_lines = [l for l in sub["text"].split("\n") if l.strip()]
-            avail = play_x - 2 * SAFE_MARGIN
-            scale = min([_fit_scale(l, FONT_SIZE, avail, True) for l in zh_lines] or [1.0])
-            if en_clean:
-                scale = min(scale, _fit_scale(en_clean, TRANS_FONT_SIZE, avail, False))
-            zh_ov = f"\\fs{round(FONT_SIZE * scale)}" if scale < 1.0 else ""
-            en_ov = f"\\fs{round(TRANS_FONT_SIZE * scale)}" if scale < 1.0 else ""
-            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
+            zh_lines_raw = [l for l in sub["text"].split("\n") if l.strip()]
+            avail = 2 * min(x, play_x - x) - 2 * SAFE_MARGIN
 
-            text = f"{{\\an2\\pos({play_x/2:.0f},{cluster_anchor_y:.0f})}}"
+            wrapped, fs_candidates = [], []
+            for l in zh_lines_raw:
+                wl, wfs = _wrap_to_fit(_ass_escape(l), FONT_SIZE, avail, True, max_lines=2)
+                wrapped.extend(wl)
+                fs_candidates.append(wfs)
+            zh_fs = min(fs_candidates) if fs_candidates else FONT_SIZE
+            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
+            zh_block = r"\N".join(wrapped)
+
+            text = f"{{\\an2\\pos({x:.0f},{cluster_anchor_y:.0f})}}"
             if en_clean:
-                text += f"{{{en_ov}\\c&HD0D0D0&}}{en_clean}\\N{{\\r{zh_ov}}}{zh_block}"
+                en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
+                en_block = r"\N".join(en_lines)
+                en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
+                text += f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
             else:
                 text += f"{{{zh_ov}}}{zh_block}" if zh_ov else zh_block
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
@@ -1072,11 +1102,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # safely), shrink the text to fit the space actually available on
         # whichever side of x is tighter.
         avail = 2 * min(x, play_x - x) - 2 * SAFE_MARGIN
-        scale = _fit_scale(zh, FONT_SIZE, avail, True)
+        zh_lines, zh_fs = _wrap_to_fit(zh, FONT_SIZE, avail, True, max_lines=2)
+        zh_block = r"\N".join(zh_lines)
+        zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
+
+        en_block, en_ov = en_clean, ""
         if en_clean:
-            scale = min(scale, _fit_scale(en_clean, TRANS_FONT_SIZE, avail, False))
-        zh_ov = f"\\fs{round(FONT_SIZE * scale)}" if scale < 1.0 else ""
-        en_ov = f"\\fs{round(TRANS_FONT_SIZE * scale)}" if scale < 1.0 else ""
+            en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
+            en_block = r"\N".join(en_lines)
+            en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
 
         if y < (play_y * 0.50):
             y_pos = y + (bh / 2) + (play_y * 0.02)
@@ -1088,11 +1122,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         if en_clean:
             if align == r"\an8":
-                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh}\\N{{{en_ov}\\c&HD0D0D0&}}{en_clean}"
+                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}\\N{{{en_ov}\\c&HD0D0D0&}}{en_block}"
             else:
-                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{{{en_ov}\\c&HD0D0D0&}}{en_clean}\\N{{\\r{zh_ov}}}{zh}"
+                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
         else:
-            text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh}"
+            text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
 
         events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
 
