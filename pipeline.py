@@ -540,12 +540,7 @@ def consolidate_overlay_clusters(cues: list, frame_w: int, frame_h: int) -> list
             continue
 
         xs = [float(c.get("x", frame_w / 2)) for c in cluster]
-        x_spread = max(xs) - min(xs)
-        # A tight group (e.g. a card with 2 detected lines) keeps its real
-        # screen position. Only fall back to centering when the fragments are
-        # genuinely scattered across the frame (a multi-column letter, where
-        # there's no single coherent position to anchor to anyway).
-        cluster_x = (frame_w / 2.0) if x_spread > frame_w * 0.25 else (sum(xs) / len(xs))
+        cluster_x = sum(xs) / len(xs)   # real average position, no centering fallback — the final clamp in write_smart_ass handles edge overflow
 
         merged_upper.append({
             "start": min(c["start"] for c in cluster),
@@ -964,74 +959,69 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
     return "\n".join(out)
        
 FONT_SIZE               = 64    # was 80 — that's ~15% of frame height (big on a PC monitor); 64 (~12%) balances phone and PC viewing
-TRANS_FONT_SIZE          = 48    # kept at the same 0.75 ratio to FONT_SIZE as before
-SUB_MARGIN_V             = 45   # fallback only — real dialogue position is now computed from the detected hardsub y
+TRANS_FONT_SIZE          = 48    # kept at the same 0.75 ratio to FONT_SIZE
+CARD_MIN_FONT            = 55    # hard floor for overlay/card text — never shrinks below this; the final clamp pass handles fit instead
+SUB_MARGIN_V             = 45   # fallback only — real dialogue position is computed from the detected hardsub y
 SAFE_MARGIN              = FONT_SIZE * 0.5   # breathing room kept from either screen edge
 DIALOGUE_LINES_RESERVED  = 2.2  # worst-case lines (en+zh, occasionally wrapped) the bottom dialogue can occupy
 LINE_HEIGHT_FACTOR       = 1.3  # vertical space one rendered line actually occupies, relative to its fontsize
 
-def _wrap_block_to_fit(zh_items: list, en_text: str, zh_base_fs: float, en_base_fs: float,
-                        avail_w: float, avail_h: float, max_lines_each: int = 2):
+def _split_simple(text: str, is_cjk: bool):
     """
-    Wraps each entry in `zh_items` (independent source lines — for a single
-    cue this is just [zh_text]; for a merged cluster it's each original
-    fragment) plus `en_text`, fitting them to BOTH avail_w (per-line width)
-    and avail_h (total block height for every resulting line combined).
-    Wrapping alone only guarantees width fits — a block that wraps to more
-    lines is also TALLER, and that height has to fit the actual vertical
-    space available before the frame edge or the dialogue zone, or it'll
-    just run off-frame a different way. This checks both together,
-    shrinking iteratively only as far as actually needed.
-    Returns (zh_lines, en_lines, zh_fontsize, en_fontsize).
+    Simple, predictable line split — no per-character width estimation.
+    English: more than 3 words -> split roughly in half. CJK: more than 6
+    characters -> split roughly in half. Anything beyond this is handled by
+    the final geometric clamp, not by trying to predict it here.
     """
-    def chunk(text, fs, is_cjk):
-        if not text:
-            return []
+    if not text:
+        return []
+    if is_cjk:
+        if len(text) <= 6:
+            return [text]
+        mid = len(text) // 2
+        return [text[:mid], text[mid:]]
+    words = text.split()
+    if len(words) <= 3:
+        return [text]
+    mid = (len(words) + 1) // 2
+    return [" ".join(words[:mid]), " ".join(words[mid:])]
+
+def _block_dims(groups):
+    """groups: list of (lines, fontsize, is_cjk). Rough (width, height) of the whole stacked block."""
+    width = 0.0
+    height = 0.0
+    for lines, fs, is_cjk in groups:
+        if not lines:
+            continue
         factor = 0.95 if is_cjk else 0.50
-        per_line = max(int(avail_w / (fs * factor)), 1) if avail_w > 0 else 1
-        if is_cjk:
-            return [text[i:i + per_line] for i in range(0, len(text), per_line)]
-        words, lines, cur = text.split(), [], ""
-        for w in words:
-            cand = f"{cur} {w}".strip()
-            if len(cand) <= per_line or not cur:
-                cur = cand
-            else:
-                lines.append(cur); cur = w
-        if cur: lines.append(cur)
-        return lines or [text]
+        width = max(width, max(len(l) for l in lines) * fs * factor)
+        height += len(lines) * fs * LINE_HEIGHT_FACTOR
+    return width, height
 
-    zh_fs, en_fs = zh_base_fs, en_base_fs
-    zh_out, en_out = [], []
-    for _ in range(8):
-        zh_out = []
-        for item in zh_items:
-            zh_out.extend(chunk(item, zh_fs, True)[:max_lines_each])
-        en_out = chunk(en_text, en_fs, False)[:max_lines_each] if en_text else []
-        block_h = len(zh_out) * zh_fs * LINE_HEIGHT_FACTOR + len(en_out) * en_fs * LINE_HEIGHT_FACTOR
-        if avail_h > 0 and block_h <= avail_h:
-            break
-        if zh_fs <= zh_base_fs * 0.3 and (not en_text or en_fs <= en_base_fs * 0.3):
-            break   # already shrunk hard — further iterations won't help meaningfully
-        shrink = max((avail_h / block_h) ** 0.5, 0.80) if avail_h > 0 else 0.80
-        zh_fs *= shrink
-        en_fs *= shrink
-    return zh_out, en_out, zh_fs, en_fs
+def _clamp_into_frame(x, y_anchor, align, width, height, play_x, play_y, margin):
+    """
+    The actual fix requested: don't try to predict/prevent overflow ahead of
+    time — lay the text out, estimate the box it occupies from the anchor +
+    alignment, and if any edge falls outside the frame, just move the anchor
+    by the minimum amount needed to bring the whole box back inside. Keeps
+    it as close as possible to its natural position instead of recentering.
+    """
+    half_w = width / 2.0
+    left, right = x - half_w, x + half_w
+    if left < margin:
+        x += (margin - left)
+    elif right > (play_x - margin):
+        x -= (right - (play_x - margin))
 
-def _usable_x_and_width(x: float, play_x: float, safe_margin: float, min_width_ratio: float = 0.30):
-    """
-    If `x` sits so close to the edge that wrapping would collapse into
-    near-unreadable slivers (or silently drop most of the text), nudge it
-    inward just enough to guarantee a workable column — while keeping it on
-    the same side (still reads as "near the left/right", not centered).
-    """
-    avail_w = 2 * min(x, play_x - x) - 2 * safe_margin
-    min_w = play_x * min_width_ratio
-    if avail_w < min_w:
-        half = min_w / 2 + safe_margin
-        x = half if x <= play_x / 2 else (play_x - half)
-        avail_w = min_w
-    return x, avail_w
+    if align == r"\an8":      # anchor = top of box, grows downward
+        top, bottom = y_anchor, y_anchor + height
+    else:                       # \an2 anchor = bottom of box, grows upward
+        top, bottom = y_anchor - height, y_anchor
+    if top < margin:
+        y_anchor += (margin - top)
+    elif bottom > (play_y - margin):
+        y_anchor -= (bottom - (play_y - margin))
+    return x, y_anchor
 
 def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
     # Exact PlayRes source/2 rule
@@ -1049,7 +1039,7 @@ def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h
     # letters). Anchored at the BOTTOM of the block so it only grows upward
     # as more lines get added — it can never drift down into the dialogue zone.
     cluster_anchor_y = min(play_y * 0.62, dialogue_zone_y)
-    dialogue_gap = play_y * 0.02   # small breathing room above the hardsub, not a big static margin
+    dialogue_gap = play_y * 0.012   # small breathing room above the hardsub — moved a little lower (closer to it) than before
 
     header = f"""\ufeff[Script Info]
 ScriptType: v4.00+
@@ -1077,87 +1067,103 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         # 1. BOTTOM DIALOGUE — positioned just above the ACTUAL detected hardsub
         # line (y/bh from OCR), not a blind static margin from the frame bottom.
-        # A static margin can't know how low the hardsub itself sits in any
-        # given video, which is exactly what was causing the overlap.
         if y > (play_y * 0.80):
-            avail_w = play_x - 2 * SAFE_MARGIN
+            zh_lines = _split_simple(sub["text"], True)
+            en_lines = _split_simple(en.strip() if en else "", False)
+            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
+            en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
+
+            groups = [(zh_lines or [sub["text"]], FONT_SIZE, True)]
+            if en_clean:
+                groups.append((en_lines or [en.strip()], TRANS_FONT_SIZE, False))
+            width, height = _block_dims(groups)
 
             y_pos = y - (bh / 2) - dialogue_gap if bh > 0 else (play_y - SUB_MARGIN_V - FONT_SIZE)
-            y_pos = max(y_pos, play_y * 0.05)   # don't let a bad detection push it off the top either
-            avail_h = y_pos - (play_y * 0.03)   # an2 grows UPWARD from y_pos — this is the room before it'd run off the top
-
-            zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
-                [sub["text"]], en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
-            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
-            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
+            y_pos = min(max(y_pos, play_y * 0.05), play_y * 0.97)
+            x_anchor = play_x / 2.0
+            x_anchor, y_pos = _clamp_into_frame(x_anchor, y_pos, r"\an2", width, height, play_x, play_y, SAFE_MARGIN)
 
             if en_clean:
-                en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
-                en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
-                text = (f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f})}}"
-                        f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}")
+                text = f"{{\\an2\\pos({x_anchor:.0f},{y_pos:.0f})}}{{\\c&HD0D0D0&}}{en_block}\\N{{\\r}}{zh_block}"
             else:
-                text = f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
+                text = f"{{\\an2\\pos({x_anchor:.0f},{y_pos:.0f})}}{zh_block}"
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
-        # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — one
-        # fixed, centered block instead of scattered per-fragment positions.
+        # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — kept at
+        # its real average position (no centering fallback), font fixed at
+        # FONT_SIZE unless the block is clearly too big, in which case it
+        # drops once to the 55px floor — then the final clamp moves it
+        # fully inside the frame.
         if sub.get("_cluster"):
             zh_items = [l for l in sub["text"].split("\n") if l.strip()]
-            x, avail_w = _usable_x_and_width(x, play_x, SAFE_MARGIN)
-            avail_h = cluster_anchor_y - (play_y * 0.03)   # an2 grows UPWARD from cluster_anchor_y
+            zh_lines = []
+            for item in zh_items:
+                zh_lines.extend(_split_simple(item, True))
+            en_lines = _split_simple(en.strip() if en else "", False)
 
-            zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
-                zh_items, en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
+            fs, trans_fs = FONT_SIZE, TRANS_FONT_SIZE
+            width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
+            if width > (play_x - 2 * SAFE_MARGIN) or height > (cluster_anchor_y - SAFE_MARGIN):
+                fs, trans_fs = CARD_MIN_FONT, round(CARD_MIN_FONT * (TRANS_FONT_SIZE / FONT_SIZE))
+                width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
+
             zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
-            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
+            zh_ov = f"\\fs{fs}" if fs != FONT_SIZE else ""
 
-            text = f"{{\\an2\\pos({x:.0f},{cluster_anchor_y:.0f})}}"
+            x_anchor, y_anchor = _clamp_into_frame(x, cluster_anchor_y, r"\an2", width, height, play_x, play_y, SAFE_MARGIN)
+
+            text = f"{{\\an2\\pos({x_anchor:.0f},{y_anchor:.0f})}}"
             if en_clean:
                 en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
-                en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
+                en_ov = f"\\fs{trans_fs}" if trans_fs != TRANS_FONT_SIZE else ""
                 text += f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
             else:
                 text += f"{{{zh_ov}}}{zh_block}" if zh_ov else zh_block
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
-        # 3. SINGLE UPPER-SCREEN OVERLAY (intros, scene cards, a lone letter line)
-        # Kept close to its natural detected x — instead of repositioning it
-        # (which falls apart once a line is too wide for ANY position to
-        # hold it safely), shrink/wrap the text to fit the space actually
-        # available on whichever side of x is tighter, only nudging x inward
-        # the minimum needed if it's right at the literal edge.
-        x, avail_w = _usable_x_and_width(x, play_x, SAFE_MARGIN)
+        # 3. SINGLE UPPER-SCREEN OVERLAY (intros, scene cards, a lone letter
+        # line) — kept at its natural detected x, no centering fallback at
+        # all. Above the source if it's in the top half, below if not, font
+        # fixed unless clearly too big (one drop to the 55px floor), final
+        # clamp pass moves it fully inside the frame.
+        zh_lines = _split_simple(sub["text"], True)
+        en_lines = _split_simple(en.strip() if en else "", False)
 
         if y < (play_y * 0.50):
             y_pos = y + (bh / 2) + (play_y * 0.02)
             align = r"\an8"
-            avail_h = dialogue_zone_y - y_pos   # an8 grows DOWNWARD — must not run into the dialogue zone
         else:
             y_pos = y - (bh / 2) - (play_y * 0.02)
             align = r"\an2"
-            avail_h = y_pos - (play_y * 0.03)   # an2 grows UPWARD — must not run off the top
-        y_pos = min(y_pos, dialogue_zone_y)   # never let the anchor itself drop into the dialogue's reserved zone
 
-        zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
-            [sub["text"]], en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
+        fs, trans_fs = FONT_SIZE, TRANS_FONT_SIZE
+        width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
+        avail_h_budget = (dialogue_zone_y - y_pos) if align == r"\an8" else (y_pos - play_y * 0.03)
+        if width > (play_x - 2 * SAFE_MARGIN) or height > max(avail_h_budget, FONT_SIZE * LINE_HEIGHT_FACTOR):
+            fs, trans_fs = CARD_MIN_FONT, round(CARD_MIN_FONT * (TRANS_FONT_SIZE / FONT_SIZE))
+            width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
+
+        x_anchor, y_pos = _clamp_into_frame(x, y_pos, align, width, height, play_x, play_y, SAFE_MARGIN)
+        # Final safety: never let it sit inside the dialogue's reserved zone either.
+        if align == r"\an2" and y_pos > dialogue_zone_y:
+            y_pos = dialogue_zone_y
+
         zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
-        zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
-
+        zh_ov = f"\\fs{fs}" if fs != FONT_SIZE else ""
         en_block, en_ov = en_clean, ""
         if en_clean:
             en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
-            en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
+            en_ov = f"\\fs{trans_fs}" if trans_fs != TRANS_FONT_SIZE else ""
 
         if en_clean:
             if align == r"\an8":
-                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}\\N{{{en_ov}\\c&HD0D0D0&}}{en_block}"
+                text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}\\N{{{en_ov}\\c&HD0D0D0&}}{en_block}"
             else:
-                text = f"{{{align}\\pos({x:.0f},{y_pos:.0f})}}{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
+                text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f})}}{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
         else:
-            text = f"{{{align}\\pos({x:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
+            text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
 
         events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
 
