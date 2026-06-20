@@ -968,22 +968,27 @@ TRANS_FONT_SIZE          = 48    # kept at the same 0.75 ratio to FONT_SIZE as b
 SUB_MARGIN_V             = 45   # fallback only — real dialogue position is now computed from the detected hardsub y
 SAFE_MARGIN              = FONT_SIZE * 0.5   # breathing room kept from either screen edge
 DIALOGUE_LINES_RESERVED  = 2.2  # worst-case lines (en+zh, occasionally wrapped) the bottom dialogue can occupy
+LINE_HEIGHT_FACTOR       = 1.3  # vertical space one rendered line actually occupies, relative to its fontsize
 
-def _wrap_to_fit(text: str, base_fs: float, avail: float, is_cjk: bool, max_lines: int = 2):
+def _wrap_block_to_fit(zh_items: list, en_text: str, zh_base_fs: float, en_base_fs: float,
+                        avail_w: float, avail_h: float, max_lines_each: int = 2):
     """
-    Wrap `text` into up to `max_lines` lines so each one fits within `avail`
-    at `base_fs`, instead of shrinking the whole thing — wrapping keeps text
-    a normal readable size and just uses more vertical space, which these
-    overlays have room for. Only shrinks (down to a 45% floor) as a last
-    resort, if even `max_lines` isn't enough to make it fit.
-    Returns (lines, fontsize_used).
+    Wraps each entry in `zh_items` (independent source lines — for a single
+    cue this is just [zh_text]; for a merged cluster it's each original
+    fragment) plus `en_text`, fitting them to BOTH avail_w (per-line width)
+    and avail_h (total block height for every resulting line combined).
+    Wrapping alone only guarantees width fits — a block that wraps to more
+    lines is also TALLER, and that height has to fit the actual vertical
+    space available before the frame edge or the dialogue zone, or it'll
+    just run off-frame a different way. This checks both together,
+    shrinking iteratively only as far as actually needed.
+    Returns (zh_lines, en_lines, zh_fontsize, en_fontsize).
     """
-    if not text:
-        return [], base_fs
-    factor = 0.95 if is_cjk else 0.50
-
-    def _chunk(fs):
-        per_line = max(int(avail / (fs * factor)), 1) if avail > 0 else 1
+    def chunk(text, fs, is_cjk):
+        if not text:
+            return []
+        factor = 0.95 if is_cjk else 0.50
+        per_line = max(int(avail_w / (fs * factor)), 1) if avail_w > 0 else 1
         if is_cjk:
             return [text[i:i + per_line] for i in range(0, len(text), per_line)]
         words, lines, cur = text.split(), [], ""
@@ -996,13 +1001,37 @@ def _wrap_to_fit(text: str, base_fs: float, avail: float, is_cjk: bool, max_line
         if cur: lines.append(cur)
         return lines or [text]
 
-    lines = _chunk(base_fs)
-    if len(lines) <= max_lines:
-        return lines, base_fs
+    zh_fs, en_fs = zh_base_fs, en_base_fs
+    zh_out, en_out = [], []
+    for _ in range(8):
+        zh_out = []
+        for item in zh_items:
+            zh_out.extend(chunk(item, zh_fs, True)[:max_lines_each])
+        en_out = chunk(en_text, en_fs, False)[:max_lines_each] if en_text else []
+        block_h = len(zh_out) * zh_fs * LINE_HEIGHT_FACTOR + len(en_out) * en_fs * LINE_HEIGHT_FACTOR
+        if avail_h > 0 and block_h <= avail_h:
+            break
+        if zh_fs <= zh_base_fs * 0.3 and (not en_text or en_fs <= en_base_fs * 0.3):
+            break   # already shrunk hard — further iterations won't help meaningfully
+        shrink = max((avail_h / block_h) ** 0.5, 0.80) if avail_h > 0 else 0.80
+        zh_fs *= shrink
+        en_fs *= shrink
+    return zh_out, en_out, zh_fs, en_fs
 
-    scale = max(max_lines / len(lines), 0.45)
-    fs = base_fs * scale
-    return _chunk(fs)[:max_lines], fs
+def _usable_x_and_width(x: float, play_x: float, safe_margin: float, min_width_ratio: float = 0.30):
+    """
+    If `x` sits so close to the edge that wrapping would collapse into
+    near-unreadable slivers (or silently drop most of the text), nudge it
+    inward just enough to guarantee a workable column — while keeping it on
+    the same side (still reads as "near the left/right", not centered).
+    """
+    avail_w = 2 * min(x, play_x - x) - 2 * safe_margin
+    min_w = play_x * min_width_ratio
+    if avail_w < min_w:
+        half = min_w / 2 + safe_margin
+        x = half if x <= play_x / 2 else (play_x - half)
+        avail_w = min_w
+    return x, avail_w
 
 def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h: int, orig_w: int = 0, orig_h: int = 0) -> None:
     # Exact PlayRes source/2 rule
@@ -1051,17 +1080,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # A static margin can't know how low the hardsub itself sits in any
         # given video, which is exactly what was causing the overlap.
         if y > (play_y * 0.80):
-            avail = play_x - 2 * SAFE_MARGIN
-            zh_lines, zh_fs = _wrap_to_fit(zh, FONT_SIZE, avail, True, max_lines=2)
-            zh_block = r"\N".join(zh_lines)
-            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
+            avail_w = play_x - 2 * SAFE_MARGIN
 
             y_pos = y - (bh / 2) - dialogue_gap if bh > 0 else (play_y - SUB_MARGIN_V - FONT_SIZE)
             y_pos = max(y_pos, play_y * 0.05)   # don't let a bad detection push it off the top either
+            avail_h = y_pos - (play_y * 0.03)   # an2 grows UPWARD from y_pos — this is the room before it'd run off the top
+
+            zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
+                [sub["text"]], en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
+            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
+            zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
 
             if en_clean:
-                en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
-                en_block = r"\N".join(en_lines)
+                en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
                 en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
                 text = (f"{{\\an2\\pos({play_x/2:.0f},{y_pos:.0f})}}"
                         f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}")
@@ -1073,22 +1104,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — one
         # fixed, centered block instead of scattered per-fragment positions.
         if sub.get("_cluster"):
-            zh_lines_raw = [l for l in sub["text"].split("\n") if l.strip()]
-            avail = 2 * min(x, play_x - x) - 2 * SAFE_MARGIN
+            zh_items = [l for l in sub["text"].split("\n") if l.strip()]
+            x, avail_w = _usable_x_and_width(x, play_x, SAFE_MARGIN)
+            avail_h = cluster_anchor_y - (play_y * 0.03)   # an2 grows UPWARD from cluster_anchor_y
 
-            wrapped, fs_candidates = [], []
-            for l in zh_lines_raw:
-                wl, wfs = _wrap_to_fit(_ass_escape(l), FONT_SIZE, avail, True, max_lines=2)
-                wrapped.extend(wl)
-                fs_candidates.append(wfs)
-            zh_fs = min(fs_candidates) if fs_candidates else FONT_SIZE
+            zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
+                zh_items, en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
+            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
             zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
-            zh_block = r"\N".join(wrapped)
 
             text = f"{{\\an2\\pos({x:.0f},{cluster_anchor_y:.0f})}}"
             if en_clean:
-                en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
-                en_block = r"\N".join(en_lines)
+                en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
                 en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
                 text += f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
             else:
@@ -1097,28 +1124,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         # 3. SINGLE UPPER-SCREEN OVERLAY (intros, scene cards, a lone letter line)
-        # Kept at its natural detected x — instead of repositioning it (which
-        # falls apart once a line is too wide for ANY position to hold it
-        # safely), shrink the text to fit the space actually available on
-        # whichever side of x is tighter.
-        avail = 2 * min(x, play_x - x) - 2 * SAFE_MARGIN
-        zh_lines, zh_fs = _wrap_to_fit(zh, FONT_SIZE, avail, True, max_lines=2)
-        zh_block = r"\N".join(zh_lines)
+        # Kept close to its natural detected x — instead of repositioning it
+        # (which falls apart once a line is too wide for ANY position to
+        # hold it safely), shrink/wrap the text to fit the space actually
+        # available on whichever side of x is tighter, only nudging x inward
+        # the minimum needed if it's right at the literal edge.
+        x, avail_w = _usable_x_and_width(x, play_x, SAFE_MARGIN)
+
+        if y < (play_y * 0.50):
+            y_pos = y + (bh / 2) + (play_y * 0.02)
+            align = r"\an8"
+            avail_h = dialogue_zone_y - y_pos   # an8 grows DOWNWARD — must not run into the dialogue zone
+        else:
+            y_pos = y - (bh / 2) - (play_y * 0.02)
+            align = r"\an2"
+            avail_h = y_pos - (play_y * 0.03)   # an2 grows UPWARD — must not run off the top
+        y_pos = min(y_pos, dialogue_zone_y)   # never let the anchor itself drop into the dialogue's reserved zone
+
+        zh_lines, en_lines, zh_fs, en_fs = _wrap_block_to_fit(
+            [sub["text"]], en.strip() if en else "", FONT_SIZE, TRANS_FONT_SIZE, avail_w, avail_h, max_lines_each=3)
+        zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
         zh_ov = f"\\fs{round(zh_fs)}" if round(zh_fs) != FONT_SIZE else ""
 
         en_block, en_ov = en_clean, ""
         if en_clean:
-            en_lines, en_fs = _wrap_to_fit(en_clean, TRANS_FONT_SIZE, avail, False, max_lines=2)
-            en_block = r"\N".join(en_lines)
+            en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
             en_ov = f"\\fs{round(en_fs)}" if round(en_fs) != TRANS_FONT_SIZE else ""
-
-        if y < (play_y * 0.50):
-            y_pos = y + (bh / 2) + (play_y * 0.02)
-            align = r"\an8" 
-        else:
-            y_pos = y - (bh / 2) - (play_y * 0.02)
-            align = r"\an2" 
-        y_pos = min(y_pos, dialogue_zone_y)   # never let it drop into the dialogue's reserved zone
 
         if en_clean:
             if align == r"\an8":
@@ -1381,17 +1412,19 @@ def out_filename(base: str, quality: str) -> str:
 def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
                      output_name: str, src_bitrate: int,
                      audio_idx: str = "a:0", has_subs: bool = True) -> list:
-    scale_factors = {"2K": 0.65, "1080p": 0.45, "720p": 0.30}
-    maxrate = max(int(src_bitrate * scale_factors.get(spec.label, 0.45) * 1.4), 500_000)
+    # Tighter ceiling than before — this was generous enough to let complex
+    # scenes balloon close to source bitrate, which hurts overall file size
+    # without much visible benefit once CQ is already doing the real work.
+    scale_factors = {"2K": 0.58, "1080p": 0.40, "720p": 0.27}
+    maxrate = max(int(src_bitrate * scale_factors.get(spec.label, 0.40) * 1.4), 500_000)
     bufsize = int(maxrate * 2.5)   
 
-    # Balanced speed/quality/compression target. CQ 19 was near-transparent
-    # but produced large files for very little visible gain on this kind of
-    # content; 22-24 is still excellent for anime/donghua (flat color fields,
-    # clean line art) and meaningfully smaller. Slightly higher CQ at lower
-    # resolutions is standard practice — less fine detail to begin with.
-    cq_map = {"2K": 22, "1080p": 23, "720p": 24}
-    cq = cq_map.get(spec.label, 23)
+    # Pushed CQ up another notch — 22-24 was already a big improvement over
+    # 19, but still more conservative than this content actually needs.
+    # 25-27 is still clearly high quality for anime/donghua (flat color
+    # fields, clean line art are very forgiving), and meaningfully smaller.
+    cq_map = {"2K": 25, "1080p": 26, "720p": 27}
+    cq = cq_map.get(spec.label, 26)
 
     return [
         "ffmpeg", "-v", "warning", "-y",
@@ -1421,13 +1454,13 @@ def build_encode_cmd(input_path: Path, out_path: Path, spec: QualitySpec,
         "-temporal-aq", "1",          
         "-aq-strength", "8",          # 15 was maxed out; 8 still helps flat-region compression without the analysis overhead
 
-        "-rc-lookahead", "32",        # less frame-buffering overhead than 50, still plenty for good rate-control decisions
-        "-bf",           "4",
+        "-rc-lookahead", "40",        # restored some lookahead — better complexity-aware bit allocation, meaningfully improves compression efficiency at the same CQ
+        "-bf",           "5",         # one more B-frame than before — B-frames are close to free compression gain on NVENC, very little speed/quality cost
         "-b_ref_mode",   "middle",
         "-refs",         "4",
         # weighted_pred removed: hevc_nvenc rejects it outright when B-frames
         # are enabled ("Weighted prediction is not supported with BFrames").
-        # bf=4 + b_ref_mode=middle give more compression benefit anyway.
+        # bf=5 + b_ref_mode=middle give more compression benefit anyway.
 
         "-c:a", "copy",
         *([ "-c:s", "copy"] if has_subs else []),
