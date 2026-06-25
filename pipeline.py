@@ -539,16 +539,20 @@ def consolidate_overlay_clusters(cues: list, frame_w: int, frame_h: int) -> list
         if not lines:
             continue
 
-        xs = [float(c.get("x", frame_w / 2)) for c in cluster]
-        cluster_x = sum(xs) / len(xs)   # real average position, no centering fallback — the final clamp in write_smart_ass handles edge overflow
+        xs  = [float(c.get("x", frame_w / 2)) for c in cluster]
+        ys  = [float(c.get("y", frame_h * 0.5)) for c in cluster]
+        bhs = [float(c.get("bh", 0)) for c in cluster]
+        cluster_x  = sum(xs) / len(xs)    # real average position — no centering fallback
+        cluster_y  = sum(ys) / len(ys)
+        cluster_bh = sum(bhs) / len(bhs) if any(bhs) else 0.0
 
         merged_upper.append({
             "start": min(c["start"] for c in cluster),
             "end":   max(c["end"]   for c in cluster),
             "text":  "\n".join(lines),
             "x": cluster_x,
-            "y": frame_h * 0.62,   # marker position; write_smart_ass anchors _cluster subs explicitly
-            "bh": 0,
+            "y": cluster_y,    # real position — write_smart_ass positions above/below it like any other overlay
+            "bh": cluster_bh,
             "_cluster": True,
         })
 
@@ -1034,16 +1038,8 @@ def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h
     scale_x = play_x / max(frame_w, 1)
     scale_y = play_y / max(frame_h, 1)
 
-    # How high up the bottom-dialogue block can realistically reach (en + zh,
-    # occasionally wrapped). Overlay text is never allowed to render below
-    # this line, or it risks visually colliding with the dialogue.
     dialogue_zone_y = play_y - (SUB_MARGIN_V + DIALOGUE_LINES_RESERVED * FONT_SIZE)
-    # Fixed anchor for consolidated multi-line overlays (e.g. on-screen
-    # letters). Anchored at the BOTTOM of the block so it only grows upward
-    # as more lines get added — it can never drift down into the dialogue zone.
-    cluster_anchor_y = min(play_y * 0.62, dialogue_zone_y)
-    dialogue_gap = play_y * 0.012   # small breathing room above the hardsub — moved a little lower (closer to it) than before
-    standard_y = play_y - SUB_MARGIN_V - FONT_SIZE * LINE_HEIGHT_FACTOR   # where a typical 1-line dialogue sits — the fallback slot
+    dialogue_gap = 100   # fixed gap above the hardsub, in PlayRes units — kept ~100 per request
 
     # Pre-scan which time ranges have a bottom-dialogue line active, so the
     # horizontal-overflow fallback below knows whether to stack above it.
@@ -1121,51 +1117,55 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         fits_horizontally = (x - half_w >= SAFE_MARGIN) and (x + half_w <= play_x - SAFE_MARGIN)
 
         if not fits_horizontally:
+            # Stays near its real side instead of relocating to the dialogue
+            # slot: anchor exactly at the horizontal middle, but flip which
+            # edge of the text sits there depending on which side the source
+            # was on — left-aligned (starts at middle, grows right) for a
+            # left-side source, right-aligned (ends at middle, grows left)
+            # for a right-side source. Vertical placement (above/below the
+            # source, capped clear of an active dialogue line) stays the
+            # same logic as a normal-fitting card.
             overlaps_dialogue = any(_intervals_overlap(sub["start"], sub["end"], ds, de) for ds, de in dialogue_intervals)
-            anchor_y = dialogue_zone_y if overlaps_dialogue else standard_y
+
+            if y < (play_y * 0.50):
+                y_pos = y + (bh / 2) + (play_y * 0.02)
+                v_align = "8"   # top-anchored, grows down
+            else:
+                y_pos = y - (bh / 2) - (play_y * 0.02)
+                v_align = "2"   # bottom-anchored, grows up
+            if overlaps_dialogue and v_align == "2":
+                y_pos = min(y_pos, dialogue_zone_y)
+
+            h_align = "1" if x <= (play_x / 2) else "3"   # 1=left (starts at middle), 3=right (ends at middle)
+            an_code = {("8", "1"): "7", ("8", "3"): "9", ("2", "1"): "1", ("2", "3"): "3"}[(v_align, h_align)]
+
+            avail_half = (play_x / 2.0) - SAFE_MARGIN
+            fs, trans_fs = FONT_SIZE, TRANS_FONT_SIZE
+            width, height = _block_dims([(pre_zh_lines, fs, True), (pre_en_lines, trans_fs, False)])
+            if width > avail_half:
+                fs, trans_fs = CARD_MIN_FONT, round(CARD_MIN_FONT * (TRANS_FONT_SIZE / FONT_SIZE))
+                width, height = _block_dims([(pre_zh_lines, fs, True), (pre_en_lines, trans_fs, False)])
+
             zh_block = r"\N".join(_ass_escape(l) for l in pre_zh_lines)
+            zh_ov = f"\\fs{fs}" if fs != FONT_SIZE else ""
+            text = f"{{\\an{an_code}\\pos({play_x/2:.0f},{y_pos:.0f})}}"
             if en_clean:
                 en_block = r"\N".join(_ass_escape(l) for l in pre_en_lines) if pre_en_lines else en_clean
-                text = (f"{{\\an2\\pos({play_x/2:.0f},{anchor_y:.0f})}}"
-                        f"{{\\c&HD0D0D0&}}[{en_block}]\\N{{\\r}}[{zh_block}]")
-            else:
-                text = f"{{\\an2\\pos({play_x/2:.0f},{anchor_y:.0f})}}[{zh_block}]"
-            events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
-            continue
-
-        # 2. CONSOLIDATED OVERLAY (e.g. a multi-line on-screen letter) — fits
-        # horizontally at its real average position (no centering fallback),
-        # font fixed at FONT_SIZE unless clearly too tall, in which case it
-        # drops once to the 55px floor — then a vertical-only clamp.
-        if sub.get("_cluster"):
-            zh_lines = pre_zh_lines
-            en_lines = pre_en_lines
-
-            fs, trans_fs = FONT_SIZE, TRANS_FONT_SIZE
-            width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
-            if height > (cluster_anchor_y - SAFE_MARGIN):
-                fs, trans_fs = CARD_MIN_FONT, round(CARD_MIN_FONT * (TRANS_FONT_SIZE / FONT_SIZE))
-                width, height = _block_dims([(zh_lines, fs, True), (en_lines, trans_fs, False)])
-
-            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
-            zh_ov = f"\\fs{fs}" if fs != FONT_SIZE else ""
-
-            x_anchor, y_anchor = _clamp_into_frame(x, cluster_anchor_y, r"\an2", width, height, play_x, play_y, SAFE_MARGIN)
-
-            text = f"{{\\an2\\pos({x_anchor:.0f},{y_anchor:.0f})}}"
-            if en_clean:
-                en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
                 en_ov = f"\\fs{trans_fs}" if trans_fs != TRANS_FONT_SIZE else ""
-                text += f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
+                if v_align == "8":
+                    text += f"{{{zh_ov}}}[{zh_block}]\\N{{{en_ov}\\c&HD0D0D0&}}[{en_block}]"
+                else:
+                    text += f"{{{en_ov}\\c&HD0D0D0&}}[{en_block}]\\N{{\\r{zh_ov}}}[{zh_block}]"
             else:
-                text += f"{{{zh_ov}}}{zh_block}" if zh_ov else zh_block
+                text += f"{{{zh_ov}}}[{zh_block}]" if zh_ov else f"[{zh_block}]"
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
-        # 3. SINGLE UPPER-SCREEN OVERLAY (intros, scene cards, a lone letter
-        # line) — fits horizontally at its natural detected x. Above the
-        # source if it's in the top half, below if not, font fixed unless
-        # clearly too tall (one drop to the 55px floor), vertical-only clamp.
+        # 2/3. CARD / OVERLAY (single fragment or a merged multi-line letter)
+        # fits horizontally at its real position — positioned right above or
+        # below the actual detected card location (never a fixed/arbitrary
+        # height), font fixed unless clearly too tall for the room available,
+        # in which case it drops once to the 55px floor.
         zh_lines = pre_zh_lines
         en_lines = pre_en_lines
 
