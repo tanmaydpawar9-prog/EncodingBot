@@ -1066,7 +1066,6 @@ def write_smart_ass(subs: list, en_texts: list, path: str, frame_w: int, frame_h
     scale_y = play_y / max(frame_h, 1)
 
     dialogue_zone_y = play_y - (SUB_MARGIN_V + DIALOGUE_LINES_RESERVED * FONT_SIZE)
-    dialogue_gap = SUB_MARGIN_V   # the gap above the hardsub IS MarginV — kept as one value, not two
 
     # Pre-scan which time ranges have a bottom-dialogue line active, so the
     # horizontal-overflow fallback below knows whether to stack above it.
@@ -1100,28 +1099,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         y  = float(sub.get("y", frame_h * 0.9)) * scale_y
         bh = float(sub.get("bh", 0)) * scale_y
 
-        # 1. BOTTOM DIALOGUE — positioned just above the ACTUAL detected hardsub
-        # line (y/bh from OCR), not a blind static margin from the frame bottom.
+        # 1. BOTTOM DIALOGUE — uses the Style's default Alignment/MarginV (no
+        # \pos override at all). Only cards/overlays get explicit positioning;
+        # normal dialogue stays on the default bottom-center slot.
         if y > (play_y * 0.80):
             zh_lines = _split_simple(sub["text"], True)
             en_lines = _split_simple(en.strip() if en else "", False)
             zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
             en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
 
-            groups = [(zh_lines or [sub["text"]], FONT_SIZE, True)]
             if en_clean:
-                groups.append((en_lines or [en.strip()], TRANS_FONT_SIZE, False))
-            width, height = _block_dims(groups)
-
-            y_pos = y - (bh / 2) - dialogue_gap if bh > 0 else (play_y - SUB_MARGIN_V - FONT_SIZE)
-            y_pos = min(max(y_pos, play_y * 0.05), play_y * 0.97)
-            x_anchor = play_x / 2.0
-            x_anchor, y_pos = _clamp_into_frame(x_anchor, y_pos, r"\an2", width, height, play_x, play_y, SAFE_MARGIN)
-
-            if en_clean:
-                text = f"{{\\an2\\pos({x_anchor:.0f},{y_pos:.0f})}}{{\\c&HD0D0D0&}}{en_block}\\N{{\\r}}{zh_block}"
+                text = f"{{\\c&HD0D0D0&}}{en_block}\\N{{\\r}}{zh_block}"
             else:
-                text = f"{{\\an2\\pos({x_anchor:.0f},{y_pos:.0f})}}{zh_block}"
+                text = zh_block
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
