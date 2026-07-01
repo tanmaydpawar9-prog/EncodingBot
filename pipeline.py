@@ -965,7 +965,7 @@ def merge_ass_dialogues(ass_text: str, max_gap: float = 0.90) -> str:
 FONT_SIZE               = 64    # was 80 — that's ~15% of frame height (big on a PC monitor); 64 (~12%) balances phone and PC viewing
 TRANS_FONT_SIZE          = 48    # kept at the same 0.75 ratio to FONT_SIZE
 CARD_MIN_FONT            = 40    # absolute floor — cards shrink continuously toward this only as far as actually needed, never below it
-SUB_MARGIN_V             = 100   # MarginV — both the style's fallback margin and the real gap above the detected hardsub use this
+SUB_MARGIN_V             = 115   # MarginV — both the style's fallback margin and the real gap above the detected hardsub use this
 SAFE_MARGIN              = FONT_SIZE * 0.5   # breathing room kept from either screen edge
 DIALOGUE_LINES_RESERVED  = 2.2  # worst-case lines (en+zh, occasionally wrapped) the bottom dialogue can occupy
 LINE_HEIGHT_FACTOR       = 1.3  # vertical space one rendered line actually occupies, relative to its fontsize
@@ -1029,31 +1029,6 @@ def _shrink_to_fit(zh_lines, en_lines, base_fs, base_trans_fs, max_width, max_he
     fits_h = (max_height <= 0) or (height <= max_height)
     return fs, trans_fs, width, height, (fits_w and fits_h)
 
-def _clamp_into_frame(x, y_anchor, align, width, height, play_x, play_y, margin):
-    """
-    The actual fix requested: don't try to predict/prevent overflow ahead of
-    time — lay the text out, estimate the box it occupies from the anchor +
-    alignment, and if any edge falls outside the frame, just move the anchor
-    by the minimum amount needed to bring the whole box back inside. Keeps
-    it as close as possible to its natural position instead of recentering.
-    """
-    half_w = width / 2.0
-    left, right = x - half_w, x + half_w
-    if left < margin:
-        x += (margin - left)
-    elif right > (play_x - margin):
-        x -= (right - (play_x - margin))
-
-    if align == r"\an8":      # anchor = top of box, grows downward
-        top, bottom = y_anchor, y_anchor + height
-    else:                       # \an2 anchor = bottom of box, grows upward
-        top, bottom = y_anchor - height, y_anchor
-    if top < margin:
-        y_anchor += (margin - top)
-    elif bottom > (play_y - margin):
-        y_anchor -= (bottom - (play_y - margin))
-    return x, y_anchor
-
 def _intervals_overlap(s1, e1, s2, e2):
     return s1 < e2 and s2 < e1
 
@@ -1115,124 +1090,84 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
-        # Pre-check: would this overlay run off the LEFT or RIGHT edge at its
-        # natural position, no matter how it's nudged? If so, stop trying to
-        # keep it at its source position at all — drop it into the normal
-        # (already proven-safe) dialogue slot instead, bracketed to mark it
-        # as an overlay rather than spoken dialogue, stacked above any
-        # dialogue line that's active at the same time.
+        # 2/3. CARD / OVERLAY (single fragment or a merged multi-line letter).
+        # Vertical anchor: above the card if it's in the lower half of the
+        # frame (room is toward the top), below it if it's in the upper half
+        # (room is toward the bottom) — i.e. always toward screen center.
         if sub.get("_cluster"):
             zh_items = [l for l in sub["text"].split("\n") if l.strip()]
         else:
             zh_items = [sub["text"]]
-        pre_zh_lines = []
+        zh_lines = []
         for item in zh_items:
-            pre_zh_lines.extend(_split_simple(item, True))
-        pre_en_lines = _split_simple(en.strip() if en else "", False)
-        pre_width, _ = _block_dims([(pre_zh_lines, FONT_SIZE, True), (pre_en_lines, TRANS_FONT_SIZE, False)])
-        half_w = pre_width / 2.0
-        fits_horizontally = (x - half_w >= SAFE_MARGIN) and (x + half_w <= play_x - SAFE_MARGIN)
+            zh_lines.extend(_split_simple(item, True))
+        en_lines = _split_simple(en.strip() if en else "", False)
 
-        if not fits_horizontally:
-            # Tier 2: stays near its real side instead of relocating —
-            # anchor exactly at the horizontal middle, flipping which edge of
-            # the text sits there depending on which side the source was on:
-            # left-aligned (starts at middle, grows right) for a left-side
-            # source, right-aligned (ends at middle, grows left) for a
-            # right-side source. Shrinks continuously (not a fixed jump) only
-            # as far as actually needed to fit the middle-to-edge half-width.
-            overlaps_dialogue = any(_intervals_overlap(sub["start"], sub["end"], ds, de) for ds, de in dialogue_intervals)
+        overlaps_dialogue = any(_intervals_overlap(sub["start"], sub["end"], ds, de) for ds, de in dialogue_intervals)
+        if y < (play_y * 0.50):
+            y_pos = y + (bh / 2) + (play_y * 0.02)
+            v_align = "8"   # top-anchored, grows down
+        else:
+            y_pos = y - (bh / 2) - (play_y * 0.02)
+            v_align = "2"   # bottom-anchored, grows up
+        if overlaps_dialogue and v_align == "2":
+            y_pos = min(y_pos, dialogue_zone_y)
+        avail_h_budget = (dialogue_zone_y - y_pos) if v_align == "8" else (y_pos - play_y * 0.03)
+        avail_h_budget = max(avail_h_budget, FONT_SIZE * LINE_HEIGHT_FACTOR)
 
-            if y < (play_y * 0.50):
-                y_pos = y + (bh / 2) + (play_y * 0.02)
-                v_align = "8"   # top-anchored, grows down
-            else:
-                y_pos = y - (bh / 2) - (play_y * 0.02)
-                v_align = "2"   # bottom-anchored, grows up
-            if overlaps_dialogue and v_align == "2":
-                y_pos = min(y_pos, dialogue_zone_y)
+        # Attempt 1: stay centered at the card's real x, shrinking
+        # continuously (not a fixed jump) only as far as actually needed.
+        avail_w_centered = 2 * min(x, play_x - x) - 2 * SAFE_MARGIN
+        fs, trans_fs, width, height, fits = _shrink_to_fit(
+            zh_lines, en_lines, FONT_SIZE, TRANS_FONT_SIZE, avail_w_centered, avail_h_budget)
 
-            h_align = "1" if x <= (play_x / 2) else "3"   # 1=left (starts at middle), 3=right (ends at middle)
+        if fits:
+            an_code = v_align   # "8" or "2" = top/bottom CENTER
+            x_anchor = x
+        else:
+            # Attempt 2: even shrunk to the floor, centering on x doesn't
+            # work — re-anchor exactly at the card's own x, but flip to edge
+            # alignment so the text grows AWAY from the near edge instead of
+            # being split across it: left-side card -> text STARTS at x
+            # (grows right); right-side card -> text ENDS at x (grows left).
+            on_left = x <= (play_x / 2)
+            avail_w_edge = (play_x - x - SAFE_MARGIN) if on_left else (x - SAFE_MARGIN)
+            fs, trans_fs, width, height, fits = _shrink_to_fit(
+                zh_lines, en_lines, FONT_SIZE, TRANS_FONT_SIZE, avail_w_edge, avail_h_budget)
+            h_align = "1" if on_left else "3"
             an_code = {("8", "1"): "7", ("8", "3"): "9", ("2", "1"): "1", ("2", "3"): "3"}[(v_align, h_align)]
+            x_anchor = x
 
-            avail_half = (play_x / 2.0) - SAFE_MARGIN
-            avail_h_budget = (dialogue_zone_y - y_pos) if v_align == "8" else (y_pos - play_y * 0.03)
-            fs, trans_fs, width, height, fits_at_floor = _shrink_to_fit(
-                pre_zh_lines, pre_en_lines, FONT_SIZE, TRANS_FONT_SIZE, avail_half, max(avail_h_budget, 0))
-
-            if not fits_at_floor:
-                # Tier 3 (worst case): even shrunk to the floor it doesn't fit
-                # in the middle-to-edge half-width — give up trying to keep it
-                # near its source and use the normal dialogue slot instead,
-                # still bracketed, stacked above an active dialogue line.
-                anchor_y = dialogue_zone_y if overlaps_dialogue else (play_y - SUB_MARGIN_V - FONT_SIZE * LINE_HEIGHT_FACTOR)
-                fs, trans_fs, _, _, _ = _shrink_to_fit(
-                    pre_zh_lines, pre_en_lines, FONT_SIZE, TRANS_FONT_SIZE, play_x - 2 * SAFE_MARGIN, 0)
-                zh_block = r"\N".join(_ass_escape(l) for l in pre_zh_lines)
-                zh_ov = f"\\fs{round(fs)}" if round(fs) != FONT_SIZE else ""
-                if en_clean:
-                    en_block = r"\N".join(_ass_escape(l) for l in pre_en_lines) if pre_en_lines else en_clean
-                    en_ov = f"\\fs{round(trans_fs)}" if round(trans_fs) != TRANS_FONT_SIZE else ""
-                    text = (f"{{\\an2\\pos({play_x/2:.0f},{anchor_y:.0f})}}"
-                            f"{{{en_ov}\\c&HD0D0D0&}}[{en_block}]\\N{{\\r{zh_ov}}}[{zh_block}]")
-                else:
-                    text = f"{{\\an2\\pos({play_x/2:.0f},{anchor_y:.0f}){zh_ov}}}[{zh_block}]"
-                events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
-                continue
-
-            zh_block = r"\N".join(_ass_escape(l) for l in pre_zh_lines)
-            zh_ov = f"\\fs{round(fs)}" if round(fs) != FONT_SIZE else ""
-            text = f"{{\\an{an_code}\\pos({play_x/2:.0f},{y_pos:.0f})}}"
+        if not fits:
+            # Attempt 3 (worst case): no position works even at the smallest
+            # readable size — give up on a hardcoded position entirely and
+            # fall back to the same default-style treatment as normal
+            # dialogue (no \an/\pos override at all), just bracketed to mark
+            # it as an overlay rather than spoken dialogue.
+            zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
             if en_clean:
-                en_block = r"\N".join(_ass_escape(l) for l in pre_en_lines) if pre_en_lines else en_clean
-                en_ov = f"\\fs{round(trans_fs)}" if round(trans_fs) != TRANS_FONT_SIZE else ""
-                if v_align == "8":
-                    text += f"{{{zh_ov}}}[{zh_block}]\\N{{{en_ov}\\c&HD0D0D0&}}[{en_block}]"
-                else:
-                    text += f"{{{en_ov}\\c&HD0D0D0&}}[{en_block}]\\N{{\\r{zh_ov}}}[{zh_block}]"
+                en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
+                text = f"{{\\c&HD0D0D0&}}[{en_block}]\\N{{\\r}}[{zh_block}]"
             else:
-                text += f"{{{zh_ov}}}[{zh_block}]" if zh_ov else f"[{zh_block}]"
+                text = f"[{zh_block}]"
             events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
             continue
 
-        # 2/3. CARD / OVERLAY (single fragment or a merged multi-line letter)
-        # fits horizontally at its real position — positioned right above or
-        # below the actual detected card location (never a fixed/arbitrary
-        # height), shrinking continuously (not a fixed jump) only as far as
-        # actually needed.
-        zh_lines = pre_zh_lines
-        en_lines = pre_en_lines
-
-        if y < (play_y * 0.50):
-            y_pos = y + (bh / 2) + (play_y * 0.02)
-            align = r"\an8"
-        else:
-            y_pos = y - (bh / 2) - (play_y * 0.02)
-            align = r"\an2"
-
-        avail_h_budget = (dialogue_zone_y - y_pos) if align == r"\an8" else (y_pos - play_y * 0.03)
-        fs, trans_fs, width, height, _ = _shrink_to_fit(
-            zh_lines, en_lines, FONT_SIZE, TRANS_FONT_SIZE, 0, max(avail_h_budget, FONT_SIZE * LINE_HEIGHT_FACTOR))
-
-        x_anchor, y_pos = _clamp_into_frame(x, y_pos, align, width, height, play_x, play_y, SAFE_MARGIN)
-        # Final safety: never let it sit inside the dialogue's reserved zone either.
-        if align == r"\an2" and y_pos > dialogue_zone_y:
-            y_pos = dialogue_zone_y
-
-        zh_block = r"\N".join(_ass_escape(l) for l in zh_lines) if zh_lines else zh
+        zh_block = r"\N".join(_ass_escape(l) for l in zh_lines)
         zh_ov = f"\\fs{round(fs)}" if round(fs) != FONT_SIZE else ""
         en_block, en_ov = en_clean, ""
         if en_clean:
             en_block = r"\N".join(_ass_escape(l) for l in en_lines) if en_lines else en_clean
             en_ov = f"\\fs{round(trans_fs)}" if round(trans_fs) != TRANS_FONT_SIZE else ""
 
+        text = f"{{\\an{an_code}\\pos({x_anchor:.0f},{y_pos:.0f})}}"
         if en_clean:
-            if align == r"\an8":
-                text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}\\N{{{en_ov}\\c&HD0D0D0&}}{en_block}"
+            if v_align == "8":
+                text += (f"{{{zh_ov}}}" if zh_ov else "") + f"{zh_block}\\N{{{en_ov}\\c&HD0D0D0&}}{en_block}"
             else:
-                text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f})}}{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
+                text += f"{{{en_ov}\\c&HD0D0D0&}}{en_block}\\N{{\\r{zh_ov}}}{zh_block}"
         else:
-            text = f"{{{align}\\pos({x_anchor:.0f},{y_pos:.0f}){zh_ov}}}{zh_block}"
+            text += f"{{{zh_ov}}}{zh_block}" if zh_ov else zh_block
 
         events.append(f"Dialogue: 0,{ts_s},{ts_e},Default,,0,0,0,,{text}")
 
